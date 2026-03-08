@@ -1,0 +1,1100 @@
+import logging
+from datetime import datetime
+from aiogram import Router, F, types, Bot
+from aiogram.filters import Command
+from aiogram.fsm.context import FSMContext
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, BufferedInputFile
+
+from config import CREATOR_ID
+from db import (
+    add_master, get_master, get_order, update_order_status, search_orders,
+    get_active_orders, add_order, complete_order, get_debtors, pay_debt,
+    update_master_settings, fmt_dt, get_daily_stats, get_monthly_stats,
+    get_weekly_history, get_all_orders, get_workers, add_worker, get_branches
+)
+from utils.states import NewOrder, SearchState, PartialPayment, PayDebtState, SettingsState, AddWorker
+from keyboards.mechanic_kb import (
+    main_menu_kb, cancel_kb, skip_kb, problem_templates_kb, warranty_templates_kb, car_models_kb, next_service_kb
+)
+from utils.receipt import generate_receipt_pdf
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, FSInputFile
+from datetime import datetime, timedelta
+import os
+
+logger = logging.getLogger(__name__)
+
+router = Router()
+
+def build_branch_keyboard(branches: list[str], prefix: str):
+    buttons = []
+    for i in range(0, len(branches), 2):
+        row = [InlineKeyboardButton(text=f"🏢 {branches[i]}", callback_data=f"{prefix}:{branches[i]}")]
+        if i + 1 < len(branches):
+            row.append(InlineKeyboardButton(text=f"🏢 {branches[i+1]}", callback_data=f"{prefix}:{branches[i+1]}"))
+        buttons.append(row)
+    buttons.append([InlineKeyboardButton(text="📊 Umumiy (Barchasi)", callback_data=f"{prefix}:all")])
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+# ═══════════════════════════════════════════════
+#  ❌ Bekor qilish / Qaytish
+# ═══════════════════════════════════════════════
+@router.message(F.text == "❌ Bekor qilish")
+@router.message(F.text == "🏠 Asosiy menyu")
+async def cancel_handler(message: types.Message, state: FSMContext):
+    await state.clear()
+    await message.answer(
+        "🏠 Asosiy menyu:",
+        reply_markup=main_menu_kb(message.from_user.id),
+    )
+
+
+# ═══════════════════════════════════════════════
+#  ➕ YANGI QABUL — Step-by-step FSM
+# ═══════════════════════════════════════════════
+@router.message(F.text == "➕ Yangi Qabul")
+async def new_order_start(message: types.Message, state: FSMContext):
+    master = await get_master(message.from_user.id)
+    if not master and message.from_user.id != CREATOR_ID:
+        return await message.answer("Siz usta emassiz.")
+        
+    await state.clear()
+    await state.set_state(NewOrder.client_name)
+    await message.answer(
+        "📝 <b>Yangi qabul</b>\n\n👤 Mijozning ism-sharifini kiriting:",
+        reply_markup=cancel_kb(),
+    )
+
+@router.message(NewOrder.client_name)
+async def process_client_name(message: types.Message, state: FSMContext):
+    await state.update_data(client_name=message.text.strip())
+    await state.set_state(NewOrder.client_phone)
+    await message.answer("📞 Mijozning telefon raqamini kiriting:")
+
+@router.message(NewOrder.client_phone)
+async def process_client_phone(message: types.Message, state: FSMContext):
+    await state.update_data(client_phone=message.text.strip())
+    await state.set_state(NewOrder.car_model)
+    await message.answer("🚗 Mashina rusumini tanlang yoki nomini yozing (masalan: Chevrolet Cobalt):", reply_markup=car_models_kb())
+
+@router.message(NewOrder.car_model)
+async def process_car_model(message: types.Message, state: FSMContext):
+    await state.update_data(car_model=message.text.strip())
+    await state.set_state(NewOrder.car_number)
+    await message.answer("🔢 Mashina davlat raqamini kiriting (Masalan: 01 A 001 AA):\n(Agar no'malum bo'lsa O'tkazib yuborish)", reply_markup=skip_kb())
+
+@router.message(NewOrder.car_number)
+async def process_car_number(message: types.Message, state: FSMContext):
+    car_number = "" if message.text == "⏭ O'tkazib yuborish" else message.text.strip()
+    await state.update_data(car_number=car_number)
+    await state.set_state(NewOrder.mileage)
+    await message.answer("📏 Mashinaning hozirgi yurgan masofasini (probeg) kiriting (Masalan: 85,000 km):\n(Agar no'malum bo'lsa O'tkazib yuborish)", reply_markup=skip_kb())
+
+@router.message(NewOrder.mileage)
+async def process_car_mileage(message: types.Message, state: FSMContext):
+    mileage = "" if message.text == "⏭ O'tkazib yuborish" else message.text.strip()
+    await state.update_data(mileage=mileage)
+    await state.set_state(NewOrder.problem)
+    await message.answer("🔍 Muammo yoki qilinadigan ishlarni tanlang yoki yozing:", reply_markup=problem_templates_kb())
+
+@router.message(NewOrder.problem)
+async def process_problem(message: types.Message, state: FSMContext):
+    await state.update_data(problem=message.text.strip())
+    await state.set_state(NewOrder.car_condition)
+    await message.answer("📋 Mashina holatini kiriting (masalan: qirilgan joylari bor):\n(Yoki o'tkazib yuboring)", reply_markup=skip_kb())
+
+@router.message(NewOrder.car_condition)
+async def process_car_condition(message: types.Message, state: FSMContext):
+    condition = "" if message.text == "⏭ O'tkazib yuborish" else message.text.strip()
+    await state.update_data(car_condition=condition)
+    await state.set_state(NewOrder.price)
+    await message.answer("💰 Taxminiy narxni kiriting (faqat son, ish haqi + ehtiyot qismlar):", reply_markup=cancel_kb())
+
+@router.message(NewOrder.price)
+async def process_price(message: types.Message, state: FSMContext):
+    price_text = message.text.strip().replace(" ", "").replace(",", "")
+    try:
+        price = float(price_text)
+    except ValueError:
+        return await message.answer("⚠️ Iltimos, faqat raqam kiriting! Masalan: 150000")
+
+    await state.update_data(price=price)
+    await state.set_state(NewOrder.cost)
+    await message.answer("🛠 <b>Harajat summasini kiriting:</b>\n(Masalan, ehtiyot qismlar yoki boshqa xarajatlar)\n\n<i>Agar harajat bo'lmasa, o'tkazib yuborishingiz mumkin:</i>", reply_markup=skip_kb())
+
+@router.message(NewOrder.cost)
+async def process_cost(message: types.Message, state: FSMContext):
+    if message.text == "⏭ O'tkazib yuborish":
+        cost = 0.0
+    else:
+        cost_text = message.text.strip().replace(" ", "").replace(",", "")
+        try:
+            cost = float(cost_text)
+        except ValueError:
+            return await message.answer("⚠️ Iltimos, faqat raqam kiriting yoki o'tkazib yuboring!")
+
+    await state.update_data(cost=cost)
+    
+    # ─── AVTOMAT KAFOLAT MUDDATI ───
+    master_id = None if message.from_user.id == CREATOR_ID else message.from_user.id
+    master = await get_master(master_id)
+    default_w = (master.get("default_warranty_days") or 0) if master else 0
+    
+    if default_w > 0:
+        await state.update_data(warranty=f"{default_w} kun")
+        data = await state.get_data()
+        text = _build_confirm_text(data, default_w)
+        
+        builder = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="✅ Tasdiqlash", callback_data="confirm_order"),
+             InlineKeyboardButton(text="❌ Bekor qilish", callback_data="cancel_order")]
+        ])
+        
+        await state.set_state(None)
+        await message.answer(text, reply_markup=builder)
+    else:
+        await state.set_state(NewOrder.warranty)
+        await message.answer(
+            "🛡 Kafolat muddatini kiriting (masalan: 1 oy, 15 kun):\n(Yoki o'tkazib yuboring)",
+            reply_markup=warranty_templates_kb()
+        )
+
+def _build_confirm_text(data: dict, auto_warranty: int = 0) -> str:
+    warranty_line = (
+        f"🛡 Kafolat (avtomat): <b>{auto_warranty} kun</b>"
+        if auto_warranty else f"🛡 Kafolat: {data.get('warranty') or '—'}"
+    )
+    mileage_line = f"📏 Probeg: {data.get('mileage')}\n" if data.get('mileage') else ""
+    return (
+        f"📋 <b>Ma'lumotlarni tasdiqlang:</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"👤 Mijoz: {data.get('client_name')}\n"
+        f"📞 Tel: {data.get('client_phone')}\n"
+        f"🚗 Model: {data.get('car_model')}\n"
+        f"🔢 Raqam: {data.get('car_number') or '—'}\n"
+        f"{mileage_line}"
+        f"🔧 Muammo: {data.get('problem')}\n"
+        f"🏷 Holati: {data.get('car_condition') or '—'}\n"
+        f"💰 Umumiy Narx: {data.get('price', 0):,.0f} so'm\n"
+        f"📉 Harajat: {data.get('cost', 0):,.0f} so'm\n"
+        f"{warranty_line}\n"
+        f"⏱ Keyingi tashrif: {data.get('next_service_text') or '—'}\n"
+    )
+
+@router.message(NewOrder.warranty)
+async def process_warranty(message: types.Message, state: FSMContext):
+    warranty = "" if message.text == "⏭ O'tkazib yuborish" else message.text.strip()
+    await state.update_data(warranty=warranty)
+    
+    await state.set_state(NewOrder.next_service_time)
+    await message.answer(
+        "⏱ <b>Keyingi tashrif (Eslatma) vaqtini belgilang:</b>\n"
+        "Mijoz mashinani kamroq haydasada, 6 oyda kelib tekshirtirib, matorni himoya qilishga eslatib turish uchun muddatni tanlang:",
+        reply_markup=next_service_kb()
+    )
+
+@router.message(NewOrder.next_service_time)
+async def process_next_service(message: types.Message, state: FSMContext):
+    btn_text = message.text.strip()
+    
+    # ⏱ 1 oydan keyin (Taksi)
+    # ⏱ 2 oydan keyin (Aktiv)
+    # ⏱ 4 oydan keyin (O'rta)
+    # ⏱ 6 oydan keyin (Kam yurar)
+    months = 0
+    if "1 oy" in btn_text: months = 1
+    elif "2 oy" in btn_text: months = 2
+    elif "4 oy" in btn_text: months = 4
+    elif "6 oy" in btn_text: months = 6
+
+    next_date = None
+    if months > 0:
+        d = datetime.now() + timedelta(days=30 * months)
+        next_date = d.strftime("%Y-%m-%d %H:%M:%S")
+
+    await state.update_data(next_service_time=next_date, next_service_text=btn_text)
+    
+    data = await state.get_data()
+    text = _build_confirm_text(data)
+    
+    builder = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Tasdiqlash", callback_data="confirm_order"),
+         InlineKeyboardButton(text="❌ Bekor qilish", callback_data="cancel_order")]
+    ])
+    await message.answer(text, reply_markup=builder)
+
+@router.callback_query(F.data == "confirm_order")
+async def process_confirm_order(callback: types.CallbackQuery, state: FSMContext):
+    await callback.message.edit_reply_markup(reply_markup=None)
+    await state.set_state(NewOrder.security_code)
+    await callback.message.answer(
+        "📝 Qo'shimcha izoh yoki parol bormi?\n(Agar yo'q bo'lsa — O'tkazib yuborish)",
+        reply_markup=skip_kb()
+    )
+    await callback.answer()
+
+@router.callback_query(F.data == "cancel_order")
+async def process_cancel_order(callback: types.CallbackQuery, state: FSMContext):
+    await state.clear()
+    await callback.message.edit_reply_markup(reply_markup=None)
+    await callback.message.answer("❌ Bekor qilindi!", reply_markup=main_menu_kb(callback.from_user.id))
+    await callback.answer()
+
+@router.message(NewOrder.security_code)
+async def process_security_code(message: types.Message, state: FSMContext):
+    security_code = "" if message.text == "⏭ O'tkazib yuborish" else message.text.strip()
+    await state.update_data(security_code=security_code)
+    data = await state.get_data()
+    data["master_id"] = message.from_user.id
+
+    try:
+        from db import add_order, get_order, get_master
+        order_id = await add_order(
+            master_id=data["master_id"],
+            client_name=data.get('client_name', ''),
+            client_phone=data.get('client_phone', ''),
+            car_model=data.get('car_model', ''),
+            car_number=data.get('car_number', ''),
+            mileage=data.get('mileage', ''),
+            problem=data.get('problem', ''),
+            car_condition=data.get('car_condition', ''),
+            price=float(data.get('price', 0)),
+            cost=float(data.get('cost', 0)),
+            warranty=data.get('warranty', ''),
+            warranty_until=data.get('warranty_until'),
+            next_service_date=data.get('next_service_time')
+        )
+        
+        # Security codeni keyin UPDATE qilishimiz mumkin, hozircha params ichida ishlaydi (add_order da generate bo'lgan)
+        
+        profit = (data.get('price') or 0) - (data.get('cost') or 0)
+        
+        summary = (
+            f"✅ <b>Buyurtma muvaffaqiyatli saqlandi!</b>\n━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"🆔 <b>Buyurtma:</b> #{order_id}\n"
+            f"👤 <b>Mijoz:</b> {data.get('client_name')}\n"
+            f"📞 <b>Tel:</b> {data.get('client_phone')}\n"
+            f"🚗 <b>Model:</b> {data.get('car_model')} (Raqam: {data.get('car_number') or '—'})\n"
+            f"📏 <b>Probeg:</b> {data.get('mileage') or '—'}\n"
+            f"🔧 <b>Muammo:</b> {data.get('problem')}\n"
+            f"💰 <b>Narx:</b> {data.get('price', 0):,.0f} so'm\n"
+            f"📉 <b>Harajat:</b> {data.get('cost', 0):,.0f} so'm\n"
+            f"💵 <b>Sof Foyda:</b> {profit:,.0f} so'm\n"
+            f"🛡 <b>Kafolat:</b> {data.get('warranty') or '—'}\n"
+            f"⏱ <b>Eslatma:</b> {data.get('next_service_text') or '—'}\n"
+        )
+        await message.answer(summary, reply_markup=main_menu_kb(message.from_user.id))
+        
+        try:
+            order = await get_order(order_id)
+            master = await get_master(message.from_user.id)
+            pdf_buffer = generate_receipt_pdf(order, master_info=master)
+            pdf_file = BufferedInputFile(pdf_buffer.read(), filename=f"kvitansiya_{order_id}.pdf")
+            await message.answer_document(pdf_file, caption=f"📄 #{order_id} — Kvitansiya (Mijozga yuborishingiz mumkin)")
+        except Exception as e:
+            logger.error(f"PDF xato: {e}", exc_info=True)
+            await message.answer("⚠️ PDF kvitansiyani yaratishda muammo yuz berdi!")
+    except Exception as e:
+        logger.error(f"Buyurtma saqlashda xato: {e}", exc_info=True)
+        await message.answer(
+            "⚠️ Buyurtmani saqlashda xatolik yuz berdi! Qaytadan urinib ko'ring yoki /start bosing.",
+            reply_markup=main_menu_kb(message.from_user.id)
+        )
+    finally:
+        await state.clear()
+
+
+# ═══════════════════════════════════════════════
+#  ⏳ FAOL ISHLAR (PROFESSIONAL WORKFLOW)
+# ═══════════════════════════════════════════════
+def _build_active_order_card(o: dict):
+    st = o.get('status', '')
+    emoji = "⚪"
+    if st == "qabul_qilindi": emoji = "⚪"
+    elif st == "jarayonda": emoji = "🟡"
+    elif st == "tayyor": emoji = "🟢"
+    elif st == "topshirildi": emoji = "�"
+    elif st == "bekor": emoji = "❌"
+    
+    mileage_line = f"📏 Probeg: {o.get('mileage')}\n" if o.get('mileage') else ""
+    text = (
+        f"{emoji} <b>#{o['id']}</b> — {o['client_name']}\n"
+        f"🚗 Model: {o['car_model']} ({o.get('car_number') or '-'}) \n"
+        f"{mileage_line}"
+        f"🔧 Muammo: {o['problem']}\n"
+        f"💰 Narx: {o.get('price', 0):,.0f} so'm\n"
+        f"📅 Qabul: {fmt_dt(o['created_at'])}\n"
+        f"📋 Status: {st.replace('_', ' ').capitalize()}"
+    )
+    
+    buttons = []
+    if st == "qabul_qilindi":
+        buttons.append(InlineKeyboardButton(text="▶ Jarayonga", callback_data=f"status_{o['id']}_jarayonda"))
+    elif st == "jarayonda":
+        buttons.append(InlineKeyboardButton(text="✅ Tayyor", callback_data=f"status_{o['id']}_tayyor"))
+    elif st == "tayyor":
+        buttons.append(InlineKeyboardButton(text="📦 Topshirildi", callback_data=f"status_{o['id']}_topshirildi"))
+        
+    if st not in ["topshirildi", "bekor"]:
+        buttons.append(InlineKeyboardButton(text="❌ Bekor", callback_data=f"status_{o['id']}_bekor"))
+    
+    ikb = InlineKeyboardMarkup(inline_keyboard=[buttons]) if buttons else None
+    return text, ikb
+
+@router.message(F.text == "⏳ Faol ishlar")
+async def active_orders_handler(message: types.Message):
+    master_id = message.from_user.id # Har doim o'zining ishlari ko'rinadi
+    from db import get_master, get_branches
+    master = await get_master(master_id)
+    if master and master.get('role') == 'boss':
+        branches = await get_branches(master_id)
+        if branches:
+            await message.answer(
+                "📅 <b>Faol ishlar</b> ro'yxatini qaysi filial bo'yicha ko'rasiz?",
+                reply_markup=build_branch_keyboard(branches, "active_branch")
+            )
+            return
+
+    await _show_active_orders(message, master_id, None)
+
+@router.callback_query(F.data.startswith("active_branch:"))
+async def active_branch_callback(callback: types.CallbackQuery):
+    bn = callback.data.split(":", 1)[1]
+    branch = None if bn == "all" else bn
+    master_id = callback.from_user.id # Har doim o'zining ishlari ko'rinadi
+    await callback.message.delete()
+    await _show_active_orders(callback.message, master_id, branch)
+    await callback.answer()
+
+async def _show_active_orders(message: types.Message, master_id: int | None, branch_name: str | None):
+    orders = await get_active_orders(master_id=master_id, branch_name=branch_name, is_personal=True)
+
+    if not orders:
+        bn_text = f" ({branch_name})" if branch_name else ""
+        return await message.answer(f"🎉 Hozirda faol ishlar yo'q!{bn_text}", reply_markup=main_menu_kb(message.from_user.id if message.from_user else CREATOR_ID))
+
+    for o in orders:
+        text, ikb = _build_active_order_card(o)
+        await message.answer(text, reply_markup=ikb)
+
+
+@router.callback_query(F.data.startswith("status_"))
+async def update_status_callback(callback: types.CallbackQuery, state: FSMContext):
+    _, order_id_str, new_status = callback.data.split("_", 2)
+    order_id = int(order_id_str)
+    
+    master_id = None if callback.from_user.id == CREATOR_ID else callback.from_user.id
+    
+    if new_status == "topshirildi":
+        ikb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="💵 Naqd", callback_data=f"pay_{order_id}_naqd")],
+            [InlineKeyboardButton(text="💳 Karta", callback_data=f"pay_{order_id}_karta")],
+            [InlineKeyboardButton(text="📝 Nasiya", callback_data=f"pay_{order_id}_nasiya")],
+            [InlineKeyboardButton(text="🔙 Orqaga", callback_data=f"status_{order_id}_tayyor")]
+        ])
+        
+        # Payment uchun vaqtinchalik o'zgartirish textini chiqarish:
+        order = await get_order(order_id, master_id=master_id)
+        if order:
+            await callback.message.edit_text(
+                f"💰 Buyurtma #{order_id} summasi: <b>{order.get('price', 0):,.0f} so'm</b>\nTo'lov turini tanlang:", 
+                reply_markup=ikb
+            )
+        else:
+            await callback.message.edit_text(f"To'lov turini tanlang (Buyurtma #{order_id}):", reply_markup=ikb)
+            
+        await callback.answer()
+        return
+        
+    await update_order_status(order_id, new_status, master_id=master_id)
+    
+    order = await get_order(order_id, master_id=master_id)
+    if order:
+        text, ikb = _build_active_order_card(order)
+        await callback.message.edit_text(text, reply_markup=ikb)
+    else:
+        st_emoji = {"jarayonda": "🟡", "tayyor": "🟢", "topshirildi": "📦", "bekor": "❌"}
+        await callback.message.edit_text(
+            f"{st_emoji.get(new_status, '')} Buyurtma #{order_id} statusi: <b>{new_status.replace('_', ' ').capitalize()}</b>"
+        )
+        
+    await callback.answer("✅ Status yangilandi!")
+
+
+@router.callback_query(F.data.startswith("pay_"))
+async def process_payment_callback(callback: types.CallbackQuery, state: FSMContext):
+    _, order_id_str, method = callback.data.split("_", 2)
+    order_id = int(order_id_str)
+    master_id = callback.from_user.id # FAQAT o'ziniki bo'yicha to'lov qiladi
+    
+    order = await get_order(order_id, master_id=master_id)
+    if not order:
+        return await callback.answer("Xatolik: Buyurtma topilmadi!", show_alert=True)
+        
+    if method == "nasiya":
+        await state.update_data(nasiya_order_id=order_id)
+        await state.set_state(PartialPayment.amount)
+        return await callback.message.edit_text(
+            f"💰 Buyurtma #{order_id} umumiy summasi: <b>{order['price']:,.0f} so'm.</b>\n\n"
+            f"Mijoz hozir (oldindan) necha pul to'ladi?\n(Agar hozir hech qancha bermagan bo'lsa 0 kiriting):",
+        )
+        
+    paid_amount = float(order['price'])
+    await complete_order(order_id, method, paid_amount, master_id=master_id)
+    
+    pm_emoji = {"naqd": "💵 Naqd", "karta": "💳 Karta"}
+    await callback.message.edit_text(
+        f"📦 Buyurtma #{order_id} topshirildi!\n"
+        f"To'lov: <b>{pm_emoji.get(method, method)}</b>\n"
+        f"Summa: {order['price']:,.0f} so'm"
+    )
+    await callback.answer("✅ Topshirildi!")
+
+@router.message(PartialPayment.amount)
+async def process_partial_payment(message: types.Message, state: FSMContext):
+    amount_text = message.text.strip().replace(" ", "").replace(",", "")
+    try:
+        paid_amount = float(amount_text)
+    except ValueError:
+        return await message.answer("⚠️ Iltimos, faqat raqam kiriting! (Masalan: 50000 yoki 0)")
+        
+    data = await state.get_data()
+    order_id = data.get("nasiya_order_id")
+    master_id = None if message.from_user.id == CREATOR_ID else message.from_user.id
+    
+    order = await get_order(order_id, master_id=master_id)
+    if not order:
+        await state.clear()
+        return await message.answer("⚠️ Xatolik: Buyurtma topilmadi!", reply_markup=main_menu_kb(message.from_user.id))
+        
+    if paid_amount > order['price']:
+        return await message.answer(f"⚠️ Kiritilgan summa umumiy narxdan ({order['price']:,.0f} so'm) ko'p bo'lishi mumkin emas!\nQaytadan kiriting:")
+        
+    await complete_order(order_id, "nasiya", paid_amount, master_id=master_id)
+    
+    await message.answer(
+        f"📦 Buyurtma #{order_id} topshirildi!\n"
+        f"To'lov: <b>📝 Nasiya (Qarz)</b>\n"
+        f"Umumiy summa: {order['price']:,.0f} so'm\n"
+        f"To'langan: {paid_amount:,.0f} so'm\n"
+        f"❗ Qarz bo'lib qoldi: {(order['price'] - paid_amount):,.0f} so'm",
+        reply_markup=main_menu_kb(message.from_user.id)
+    )
+    await state.clear()
+
+
+# ═══════════════════════════════════════════════
+#  📝 QARZDORLAR
+# ═══════════════════════════════════════════════
+@router.message(F.text == "📝 Qarzdorlar")
+async def debtors_handler(message: types.Message):
+    master_id = message.from_user.id # Har doim o'ziniki
+    master = await get_master(master_id)
+    if master and master.get('role') == 'boss':
+        branches = await get_branches(master_id)
+        if branches:
+            await message.answer(
+                "📝 <b>Qarzdorlar</b> ro'yxatini qaysi filial bo'yicha ko'rasiz?",
+                reply_markup=build_branch_keyboard(branches, "debt_branch")
+            )
+            return
+
+    await show_debtors_page(message, page=1, branch_name=None)
+
+@router.callback_query(F.data.startswith("debt_branch:"))
+async def debt_branch_callback(callback: types.CallbackQuery):
+    bn = callback.data.split(":", 1)[1]
+    branch = None if bn == "all" else bn
+    master_id = callback.from_user.id # Har doim o'ziniki
+    await callback.message.delete()
+    await show_debtors_page(callback.message, page=1, is_callback=False, user_id=callback.from_user.id, branch_name=branch)
+    await callback.answer()
+
+@router.callback_query(F.data.startswith("debtpage_"))
+async def debtors_page_callback(callback: types.CallbackQuery):
+    parts = callback.data.split("_", 2)
+    page = int(parts[1])
+    bn = parts[2] if len(parts) > 2 else "all"
+    branch = None if bn == "all" else bn
+    await show_debtors_page(callback.message, page=page, is_callback=True, user_id=callback.from_user.id, branch_name=branch)
+    await callback.answer()
+
+@router.callback_query(F.data == "ignore")
+async def ignore_callback(callback: types.CallbackQuery):
+    await callback.answer()
+
+async def show_debtors_page(message: types.Message, page: int = 1, is_callback: bool = False, user_id: int | None = None, branch_name: str | None = None):
+    uid = user_id if user_id else message.from_user.id
+    master_id = uid # Har doim o'ziniki
+    debtors = await get_debtors(master_id, branch_name=branch_name, is_personal=True)
+    
+    if not debtors:
+        bn_text = f" ({branch_name})" if branch_name else ""
+        text = f"🎉 Hozircha qarzdorlar yo'q!{bn_text}"
+        if is_callback:
+            await message.edit_text(text)
+        else:
+            await message.answer(text, reply_markup=main_menu_kb(uid))
+        return
+
+    PER_PAGE = 5
+    total_pages = (len(debtors) + PER_PAGE - 1) // PER_PAGE
+    if page < 1: page = 1
+    if page > total_pages: page = total_pages
+    
+    start_idx = (page - 1) * PER_PAGE
+    end_idx = start_idx + PER_PAGE
+    current_debtors = debtors[start_idx:end_idx]
+    
+    text = f"📝 <b>Qarzdorlar ro'yxati</b> (Sahifa: {page} / {total_pages})\n"
+    text += f"Jami qarzdorlar: {len(debtors)} ta\n\n"
+    
+    buttons = []
+    
+    for o in current_debtors:
+        qarz_summasi = o['price'] - o['paid_amount']
+        text += (
+            f"👤 <b>{o['client_name']}</b> (📞 {o['client_phone']})\n"
+            f"🆔 <b>#{o['id']}</b> | 🚗 {o['car_model']}\n"
+            f"💰 Umumiy: {o['price']:,.0f} so'm\n"
+            f"❗ <b>Qolgan qarz: {qarz_summasi:,.0f} so'm</b>\n"
+            f"📅 Sana: {fmt_dt(o['completed_at'])}\n"
+            f"━━━━━━━━━━━━━━━━━━\n"
+        )
+        buttons.append([InlineKeyboardButton(text=f"✅ #{o['id']} ni to'lash", callback_data=f"paydebt_{o['id']}")])
+        
+    bn_data = branch_name if branch_name else "all"
+    nav_buttons = []
+    if page > 1:
+        nav_buttons.append(InlineKeyboardButton(text="⬅️ Oldingi", callback_data=f"debtpage_{page-1}_{bn_data}"))
+    
+    nav_buttons.append(InlineKeyboardButton(text=f"{page}/{total_pages}", callback_data="ignore"))
+    
+    if page < total_pages:
+        nav_buttons.append(InlineKeyboardButton(text="Keyingi ➡️", callback_data=f"debtpage_{page+1}_{bn_data}"))
+        
+    buttons.append(nav_buttons)
+    ikb = InlineKeyboardMarkup(inline_keyboard=buttons)
+    
+    if is_callback:
+        await message.edit_text(text, reply_markup=ikb)
+    else:
+        await message.answer(text, reply_markup=ikb)
+
+@router.callback_query(F.data.startswith("paydebt_"))
+async def process_paydebt_callback(callback: types.CallbackQuery, state: FSMContext):
+    _, order_id_str = callback.data.split("_", 1)
+    order_id = int(order_id_str)
+    
+    master_id = callback.from_user.id # Har doim o'ziniki
+    order = await get_order(order_id, master_id=master_id)
+    
+    if not order:
+        return await callback.answer("Xato: Buyurtma topilmadi!", show_alert=True)
+        
+    qarz_summasi = order['price'] - order['paid_amount']
+    
+    await state.update_data(paydebt_order_id=order_id, qarz_summasi=qarz_summasi)
+    await state.set_state(PayDebtState.amount)
+    
+    await callback.message.edit_text(
+        f"📝 <b>Qarz to'lash (Buyurtma #{order_id})</b>\n\n"
+        f"👤 Mijoz: {order['client_name']}\n"
+        f"💵 Qolgan qarz summasi: <b>{qarz_summasi:,.0f} so'm</b>\n\n"
+        f"Mijoz qancha to'lamoqda? (raqamda kiriting):"
+    )
+    await callback.answer()
+
+@router.message(PayDebtState.amount)
+async def process_paydebt_amount(message: types.Message, state: FSMContext):
+    amount_text = message.text.strip().replace(" ", "").replace(",", "")
+    try:
+        additional_amount = float(amount_text)
+    except ValueError:
+        return await message.answer("⚠️ Iltimos, faqat raqam kiriting!")
+        
+    data = await state.get_data()
+    order_id = data.get("paydebt_order_id")
+    qarz_summasi = data.get("qarz_summasi")
+    
+    if additional_amount > qarz_summasi:
+        return await message.answer(f"⚠️ Kiritilgan summa qarz summasidan ({qarz_summasi:,.0f} so'm) ko'p!\nQaytadan kiriting:")
+        
+    master_id = None if message.from_user.id == CREATOR_ID else message.from_user.id
+    is_fully_paid = await pay_debt(order_id, additional_amount, master_id=master_id)
+    
+    text = f"✅ <b>To'lov qabul qilindi! (Buyurtma #{order_id})</b>\n"
+    text += f"To'landi: {additional_amount:,.0f} so'm\n"
+    if is_fully_paid:
+        text += "🎉 <b>Qarz to'liq uzildi!</b>"
+    else:
+        text += f"❗ Qolgan qarz: {(qarz_summasi - additional_amount):,.0f} so'm"
+        
+    await message.answer(text, reply_markup=main_menu_kb(message.from_user.id))
+    await state.clear()
+
+
+# ═══════════════════════════════════════════════
+#  🔍 QIDIRUV VA MIJOZ TARIXI
+# ═══════════════════════════════════════════════
+@router.message(F.text == "🔍 Qidiruv")
+async def search_start(message: types.Message, state: FSMContext):
+    await state.set_state(SearchState.query)
+    await message.answer(
+        "🔍 <b>Qidiruv</b>\n\n"
+        "Mijozni quyidagilar bo'yicha izlashingiz mumkin:\n"
+        "👤 Ism yoki raqam\n"
+        "🚗 Model yoki Davlat raqami\n"
+        "📅 Sana: <code>15.03</code> yoki <code>15 mart</code>\n"
+        "🗓 Oy: <code>mart</code> yoki <code>03</code>", 
+        reply_markup=cancel_kb()
+    )
+
+@router.message(SearchState.query)
+async def search_process(message: types.Message, state: FSMContext):
+    query = message.text.strip()
+    
+    master_id = None if message.from_user.id == CREATOR_ID else message.from_user.id
+    results = await search_orders(query, master_id=master_id)
+
+    if not results:
+        await message.answer(f"😕 <b>«{query}»</b> bo'yicha hech narsa topilmadi.", reply_markup=main_menu_kb(message.from_user.id))
+        await state.clear()
+        return
+
+    text = f"🔍 <b>«{query}»</b> bo'yicha tarix:\n━━━━━━━━━━━━━━━━━━━━━━\n\n"
+    for o in results:
+        st = o['status'].upper()
+        if st == "TOP_SHIRILDI": st = "TOPSHIRILDI 📦"
+        completed_line = f"   ✅ Topshirildi: {fmt_dt(o['completed_at'])}\n" if o.get('completed_at') else ""
+        text += (
+            f"<b>#{o['id']}</b> — {o['client_name']} ({st})\n"
+            f"   🚗 {o['car_model']} | 🔧 {o['problem']}\n"
+            f"   📞 {o['client_phone']} | 💰 {o['price']:,.0f} so'm\n"
+            f"   📅 Qabul: {fmt_dt(o['created_at'])}\n"
+            f"{completed_line}\n"
+        )
+    await message.answer(text, reply_markup=main_menu_kb(message.from_user.id))
+    await state.clear()
+
+
+# ═══════════════════════════════════════════════
+#  ⚙️ SOZLAMALAR (Master profili)
+# ═══════════════════════════════════════════════
+@router.message(F.text == "⚙️ Sozlamalar")
+async def settings_handler(message: types.Message):
+    await show_settings(message, message.from_user.id)
+
+async def show_settings(message: types.Message, user_id: int):
+    master_id = None if user_id == CREATOR_ID else user_id
+    master = await get_master(master_id)
+    if not master:
+        return await message.answer("Siz usta emassiz.")
+
+    reminders_on = master.get('reminders_enabled', 0)
+    toggle_emoji = "🔔 Yoqilgan ✅" if reminders_on else "🔕 O'chirilgan ❌"
+    toggle_action = "reminders_off" if reminders_on else "reminders_on"
+
+    text = (
+        "⚙️ <b>Sozlamalar</b>\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        f"🏢 <b>Ustaxona nomi:</b> {master.get('workshop_name') or 'Kiritilmagan'}\n"
+        f"📍 <b>Manzil:</b> {master.get('address') or 'Kiritilmagan'}\n"
+        f"📞 <b>Telefon:</b> {master.get('phone') or 'Kiritilmagan'}\n"
+        f"🛡 <b>Standart Kafolat:</b> {master.get('default_warranty_days') or 0} kun\n"
+        f"🔔 <b>Eslatmalar:</b> {toggle_emoji}\n"
+        f"⏰ <b>Eslatma vaqti:</b> {master.get('reminder_time') or '09:00'}\n\n"
+        "O'zgartirmoqchi bo'lgan ma'lumotni tanlang:"
+    )
+
+    markup = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🏢 Ustaxona nomi", callback_data="set_workshop_name"),
+         InlineKeyboardButton(text="📍 Manzil", callback_data="set_address")],
+        [InlineKeyboardButton(text="📞 Telefon", callback_data="set_phone"),
+         InlineKeyboardButton(text="🛡 Kafolat muddati", callback_data="set_warranty")],
+        [InlineKeyboardButton(text=f"{'🔕 O\'chirish' if reminders_on else '🔔 Yoqish'}", callback_data=toggle_action),
+         InlineKeyboardButton(text="⏰ Eslatma vaqti", callback_data="set_reminder")],
+    ])
+    if master.get('role') == 'boss':
+        markup.inline_keyboard.append([InlineKeyboardButton(text="👥 Mening Jamoam", callback_data="my_team")])
+
+    await message.answer(text, reply_markup=markup)
+
+@router.callback_query(F.data.in_({"reminders_on", "reminders_off"}))
+async def toggle_reminders(callback: types.CallbackQuery):
+    master_id = None if callback.from_user.id == CREATOR_ID else callback.from_user.id
+    enabled = 1 if callback.data == "reminders_on" else 0
+    await update_master_settings(master_id, reminders_enabled=enabled)
+    status = "✅ Eslatmalar yoqildi! Har kuni belgilangan vaqtda 3+ kunlik ishlar haqida xabar olasiz." if enabled else "❌ Eslatmalar o'chirildi."
+    await callback.answer(status, show_alert=True)
+    # Sozlamalar sahifasini yangilash
+    master = await get_master(master_id)
+    reminders_on = master.get('reminders_enabled', 0)
+    toggle_emoji = "🔔 Yoqilgan ✅" if reminders_on else "🔕 O'chirilgan ❌"
+    text = (
+        "⚙️ <b>Sozlamalar</b>\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        f"🏢 <b>Ustaxona nomi:</b> {master.get('workshop_name') or 'Kiritilmagan'}\n"
+        f"📍 <b>Manzil:</b> {master.get('address') or 'Kiritilmagan'}\n"
+        f"📞 <b>Telefon:</b> {master.get('phone') or 'Kiritilmagan'}\n"
+        f"🛡 <b>Standart Kafolat:</b> {master.get('default_warranty_days') or 0} kun\n"
+        f"🔔 <b>Eslatmalar:</b> {toggle_emoji}\n"
+        f"⏰ <b>Eslatma vaqti:</b> {master.get('reminder_time') or '09:00'}\n\n"
+        "O'zgartirmoqchi bo'lgan ma'lumotni tanlang:"
+    )
+    markup = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🏢 Ustaxona nomi", callback_data="set_workshop_name"),
+         InlineKeyboardButton(text="📍 Manzil", callback_data="set_address")],
+        [InlineKeyboardButton(text="📞 Telefon", callback_data="set_phone"),
+         InlineKeyboardButton(text="🛡 Kafolat muddati", callback_data="set_warranty")],
+        [InlineKeyboardButton(text=f"{'🔕 O\'chirish' if reminders_on else '🔔 Yoqish'}", callback_data='reminders_off' if reminders_on else 'reminders_on'),
+         InlineKeyboardButton(text="⏰ Eslatma vaqti", callback_data="set_reminder")],
+    ])
+    if master.get('role') == 'boss':
+        markup.inline_keyboard.append([InlineKeyboardButton(text="👥 Mening Jamoam", callback_data="my_team")])
+        
+    await callback.message.edit_text(text, reply_markup=markup)
+
+@router.callback_query(F.data.startswith("set_"))
+async def process_settings_callbacks(callback: types.CallbackQuery, state: FSMContext):
+    action = callback.data.replace("set_", "")
+    
+    if action == "workshop_name":
+        await state.set_state(SettingsState.workshop_name)
+        await callback.message.edit_text("🏢 Kvitansiya uchun <b>Ustaxona nomini</b> kiriting (qisqa va aniq):", reply_markup=None)
+    elif action == "address":
+        await state.set_state(SettingsState.address)
+        await callback.message.edit_text("📍 Kvitansiya uchun <b>Ustaxona manzilini</b> kiriting (qisqa, tushunarli):", reply_markup=None)
+    elif action == "phone":
+         await state.set_state(SettingsState.phone)
+         await callback.message.edit_text("📞 Mijozlar sizga bog'lanishi uchun <b>Telefon raqamingizni</b> kiriting:", reply_markup=None)
+    elif action == "warranty":
+         await state.set_state(SettingsState.warranty_days)
+         await callback.message.edit_text("🛡 Standart kafolat beriladigan kunlar sonini kiriting (raqam bilan, masalan: 7):", reply_markup=None)
+    elif action == "reminder":
+         await state.set_state(SettingsState.reminder_time)
+         await callback.message.edit_text(
+            "⏰ <b>Eslatma vaqti</b>\n\n"
+            "3 kundan ko'proq vaqt olib yotgan, topshirilmagan ishlar bo'yicha\n"
+            "har kuni avtomatik eslatma keladi.\n\n"
+            "Vaqtni <b>HH:MM</b> formatida yozing:\n"
+            "(Masalan: <code>09:00</code> yoki <code>20:30</code>)",
+            reply_markup=None
+         )
+         
+    await callback.answer()
+
+@router.message(SettingsState.workshop_name)
+async def save_workshop_name(message: types.Message, state: FSMContext):
+    master_id = None if message.from_user.id == CREATOR_ID else message.from_user.id
+    await update_master_settings(master_id, workshop_name=message.text.strip())
+    await message.answer("✅ Ustaxona nomi saqlandi!", reply_markup=main_menu_kb(message.from_user.id))
+    await state.clear()
+
+@router.message(SettingsState.address)
+async def save_address(message: types.Message, state: FSMContext):
+    master_id = None if message.from_user.id == CREATOR_ID else message.from_user.id
+    await update_master_settings(master_id, address=message.text.strip())
+    await message.answer("✅ Manzil saqlandi!", reply_markup=main_menu_kb(message.from_user.id))
+    await state.clear()
+    
+@router.message(SettingsState.phone)
+async def save_phone(message: types.Message, state: FSMContext):
+    master_id = None if message.from_user.id == CREATOR_ID else message.from_user.id
+    await update_master_settings(master_id, phone=message.text.strip())
+    await message.answer("✅ Telefon raqam saqlandi!", reply_markup=main_menu_kb(message.from_user.id))
+    await state.clear()
+
+@router.message(SettingsState.warranty_days)
+async def save_warranty_days(message: types.Message, state: FSMContext):
+    days_txt = message.text.strip()
+    if not days_txt.isdigit():
+        return await message.answer("⚠️ Faqat kunlar sonini (raqam) kiriting. Masalan: 10")
+    
+    master_id = None if message.from_user.id == CREATOR_ID else message.from_user.id
+    await update_master_settings(master_id, default_warranty_days=int(days_txt))
+    await message.answer("✅ Standart kafolat kunlari saqlandi!", reply_markup=main_menu_kb(message.from_user.id))
+    await state.clear()
+
+@router.message(SettingsState.reminder_time)
+async def save_reminder_time(message: types.Message, state: FSMContext):
+    time_str = message.text.strip()
+    if len(time_str) != 5 or ':' not in time_str:
+        return await message.answer("⚠️ Vaqtni HH:MM formatida kiriting. Masalan: 09:00")
+        
+    master_id = None if message.from_user.id == CREATOR_ID else message.from_user.id
+    await update_master_settings(master_id, reminder_time=time_str)
+    await message.answer(f"✅ Eslatmalar vaqti {time_str} ga o'rnatildi!", reply_markup=main_menu_kb(message.from_user.id))
+    await state.clear()
+
+
+# ═══════════════════════════════════════════════
+#  📊 STATISTIKA
+# ═══════════════════════════════════════════════
+@router.message(F.text == "📊 Statistika")
+async def stats_handler(message: types.Message):
+    master_id = message.from_user.id # Har doim o'ziniki
+    master = await get_master(master_id)
+    if master and master.get('role') == 'boss':
+        branches = await get_branches(master_id)
+        if branches:
+            await message.answer(
+                "📊 <b>Statistika</b> tahlili uchun qaysi filialni tanlaysiz?",
+                reply_markup=build_branch_keyboard(branches, "stats_branch")
+            )
+            return
+            
+    await _show_statistics(message, master_id, None)
+
+@router.callback_query(F.data.startswith("stats_branch:"))
+async def stats_branch_callback(callback: types.CallbackQuery):
+    bn = callback.data.split(":", 1)[1]
+    branch = None if bn == "all" else bn
+    master_id = callback.from_user.id # Har doim o'ziniki
+    await callback.message.delete()
+    await _show_statistics(callback.message, master_id, branch, is_edit=True)
+    await callback.answer()
+
+async def _show_statistics(message: types.Message, master_id: int | None, branch_name: str | None, is_edit: bool = False):
+    daily   = await get_daily_stats(master_id, branch_name)
+    monthly = await get_monthly_stats(master_id, branch_name)
+    
+    d_profit  = daily['completed_total']  - daily['completed_cost']
+    m_profit  = monthly['completed_total'] - monthly['completed_cost']
+    
+    bn_text = f" ({branch_name})" if branch_name else ""
+
+    text = (
+        f"📊 <b>STATISTIKA</b>{bn_text}\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        "📅 <b>Bugun:</b>\n"
+        f"  📥 Qabul: <b>{daily['received_count']}</b>  ✅ Topshirildi: <b>{daily['completed_count']}</b>\n"
+        f"  💰 Tushum: <b>{daily['completed_total']:,.0f} so'm</b>\n"
+        f"  📉 Harajat: {daily['completed_cost']:,.0f} so'm\n"
+        f"  💵 Sof Foyda: <b>{d_profit:,.0f} so'm</b>\n"
+        f"  💳 Naqd: {daily['naqd']:,.0f}  |  Karta: {daily['karta']:,.0f}  |  Nasiya: {daily['nasiya']:,.0f}\n\n"
+        "📆 <b>Shu oy:</b>\n"
+        f"  📥 Qabul: <b>{monthly['received_count']}</b>  ✅ Topshirildi: <b>{monthly['completed_count']}</b>\n"
+        f"  📦 Faol: <b>{monthly.get('active_count', 0)}</b>\n"
+        f"  💰 Tushum: <b>{monthly['completed_total']:,.0f} so'm</b>\n"
+        f"  📉 Harajat: {monthly['completed_cost']:,.0f} so'm\n"
+        f"  💵 Sof Foyda: <b>{m_profit:,.0f} so'm</b>\n"
+        f"  💳 Naqd: {monthly['naqd']:,.0f}  |  Karta: {monthly['karta']:,.0f}  |  Nasiya: {monthly['nasiya']:,.0f}\n"
+    )
+    
+    bn_data = branch_name if branch_name else "all"
+    markup = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🗓 Oxirgi 7 kunlik tarix", callback_data=f"stats_weekly_{bn_data}")],
+        [InlineKeyboardButton(text="📥 Barcha Mijozlar (Excel)", callback_data=f"stats_excel_{bn_data}")]
+    ])
+    
+    if is_edit:
+        await message.edit_text(text, reply_markup=markup)
+    else:
+        await message.answer(text, reply_markup=markup)
+
+@router.callback_query(F.data.startswith("stats_weekly_"))
+async def process_weekly_history(callback: types.CallbackQuery):
+    bn = callback.data.replace("stats_weekly_", "")
+    branch_name = None if bn == "all" else bn
+    master_id = callback.from_user.id # Har doim o'ziniki
+    history = await get_weekly_history(master_id, branch_name)
+    
+    if not history:
+        await callback.answer("😕 Oxirgi 7 kunda hech qanday tarix topilmadi.", show_alert=True)
+        return
+        
+    bn_text = f" ({branch_name})" if branch_name else ""
+    text = f"🗓 <b>Oxirgi 7 kunlik tarix{bn_text}:</b>\n━━━━━━━━━━━━━━━━━━━━━━\n\n"
+    for i, o in enumerate(history, 1):
+        st = o['status'].upper()
+        if st == "TOP_SHIRILDI": st = "TOPSHIRILDI 📦"
+        text += (
+            f"<b>{i}. {o['client_name']} ({st})</b>\n"
+            f"   🚗 {o['car_model']} ({o.get('car_number') or '-'}) | 🔧 {o['problem']}\n"
+            f"   💰 {o['price']:,.0f} so'm | 📅 {fmt_dt(o['created_at'])}\n\n"
+        )
+    
+    if len(text) > 4000:
+        text = text[:4000] + "\n... (davomi bor)"
+        
+    await callback.message.answer(text)
+    await callback.answer()
+
+@router.callback_query(F.data.startswith("stats_excel_"))
+async def process_excel_export(callback: types.CallbackQuery):
+    await callback.answer("⏳ Excel fayl tayyorlanmoqda...", show_alert=False)
+    bn = callback.data.replace("stats_excel_", "")
+    branch_name = None if bn == "all" else bn
+    master_id = callback.from_user.id # Har doim o'ziniki
+    
+    orders = await get_all_orders(master_id, branch_name)
+    if not orders:
+        return await callback.message.answer("😕 Bazada hali mijozlar yo'q.")
+        
+    import openpyxl
+    from openpyxl.styles import Font, Alignment, PatternFill
+    
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = f"Mijozlar Bazasi{' - ' + branch_name if branch_name else ''}"
+    
+    headers = ["T/r", "Qabul Qilingan Vaqt", "Status", "Mijoz Ismi", "Telefon", "Mashina Modeli", "Davlat Raqami", "Probeg", "Muammo", "Narx", "Xarajat", "Sof Foyda"]
+    ws.append(headers)
+    
+    header_fill = PatternFill(start_color="10b981", end_color="10b981", fill_type="solid")
+    header_font = Font(bold=True, color="ffffff")
+    for col_num, cell in enumerate(ws[1], 1):
+        cell.fill = header_fill
+        cell.font = header_font
+        cell.alignment = Alignment(horizontal="center")
+        
+    total_price = 0
+    total_cost = 0
+    total_profit = 0
+        
+    for i, o in enumerate(orders, 1):
+        dt_val = o.get('created_at', '')[:16]
+        price = o.get('price') or 0
+        cost = o.get('cost') or 0
+        profit = price - cost
+        
+        total_price += price
+        total_cost += cost
+        total_profit += profit
+        
+        row = [
+            i,
+            dt_val,
+            str(o.get('status', '')).upper(),
+            o.get('client_name', ''),
+            str(o.get('client_phone', '')),
+            o.get('car_model', ''),
+            o.get('car_number', ''),
+            o.get('mileage', ''),
+            o.get('problem', ''),
+            price,
+            cost,
+            profit
+        ]
+        ws.append(row)
+        
+    # Yig'indini (Jami) jadval oxiriga yozish
+    ws.append([])
+    ws.append(["", "", "", "", "", "", "", "", "JAMI YIG'INDI:", total_price, total_cost, total_profit])
+    
+    total_row_idx = ws.max_row
+    # Jami qatorini qalin qilib belgilash
+    for col_idx in range(9, 13):
+        cell = ws.cell(row=total_row_idx, column=col_idx)
+        cell.font = Font(bold=True)
+        cell.fill = PatternFill(start_color="e6f2ff", end_color="e6f2ff", fill_type="solid")
+        
+    # Auto-adjust column widths roughly
+    for col in ws.columns:
+        max_length = 0
+        column = col[0].column_letter
+        for cell in col:
+            try:
+                if len(str(cell.value)) > max_length:
+                    max_length = len(str(cell.value))
+            except:
+                pass
+        adjusted_width = (max_length + 2)
+        ws.column_dimensions[column].width = min(adjusted_width, 40)
+        
+    file_name = f"Mijozlar_Bazasi_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx"
+    wb.save(file_name)
+    
+    await callback.message.answer_document(
+        document=FSInputFile(file_name),
+        caption="📊 Barcha mijozlaringiz ro'yxati (Excel formatida)"
+    )
+    
+    # Qoldiqni o'chirish
+    try:
+        os.remove(file_name)
+    except:
+        pass
+    
+    await callback.answer()
+
+# ═══════════════════════════════════════════════
+#  JAMOAVIY BOSHQARUV (XODIMLAR / SHOGIRDLAR)
+# ═══════════════════════════════════════════════
+
+@router.callback_query(F.data == "my_team")
+async def my_team_handler(callback: types.CallbackQuery):
+    master_id = None if callback.from_user.id == CREATOR_ID else callback.from_user.id
+    workers = await get_workers(master_id)
+    
+    text = f"👥 <b>Mening Jamoam ({len(workers)} kishi)</b>\n━━━━━━━━━━━━━━━━━━\n\n"
+    if not workers:
+        text += "Sizda hali ishchilar tayinlanmagan.\n(Ishchi - o'z mijozlarini kiritib, ishini o'zi bitkazadi va foyda unga yoziladi, biroq statistikasini siz to'liq kuzata olasiz)."
+    else:
+        for i, w in enumerate(workers, 1):
+            phone = w.get('phone') or "Yo'q"
+            name = w.get('full_name') or w.get('username') or "Noma'lum"
+            text += f"{i}. <b>{name}</b> (<code>ID: {w['telegram_id']}</code>)\n📞 {phone}\n\n"
+            
+    text += "\nYangi ishchi / shogird qo'shish uchun pastdagi tugmani bosing."
+    
+    markup = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="➕ Xodim qo'shish", callback_data="add_team_worker")],
+        [InlineKeyboardButton(text="🔙 Orqaga", callback_data="back_to_settings_main")]
+    ])
+    
+    await callback.message.edit_text(text, reply_markup=markup)
+
+@router.callback_query(F.data == "back_to_settings_main")
+async def back_to_settings_main_handler(callback: types.CallbackQuery):
+    await toggle_reminders(callback)
+
+@router.callback_query(F.data == "add_team_worker")
+async def add_worker_start(callback: types.CallbackQuery, state: FSMContext):
+    await state.set_state(AddWorker.waiting_for_id)
+    await callback.message.edit_text(
+        "📝 O'z ustaxonangizga xodim qo'shish:\n\n"
+        "Shogird/xodimning <b>Telegram ID</b> raqamini yozib yuboring.\n"
+        "(Ushbu raqamni kishi o'zining telegramidan @getmyid_bot kabi botlarga kirib bilib olishi mumkin).", 
+        reply_markup=None
+    )
+    await callback.answer()
+
+@router.message(AddWorker.waiting_for_id)
+async def add_worker_id(message: types.Message, state: FSMContext):
+    if not message.text.isdigit():
+        return await message.answer("⚠️ Telegram ID faqat raqamlardan iborat bo'ladi! Raqamni qaytadan kiriting:")
+    
+    await state.update_data(worker_id=int(message.text.strip()))
+    await state.set_state(AddWorker.waiting_for_name)
+    await message.answer("Endi Xodimning ism-sharifini yozing:")
+
+@router.message(AddWorker.waiting_for_name)
+async def add_worker_name(message: types.Message, state: FSMContext):
+    await state.update_data(worker_name=message.text.strip())
+    await state.set_state(AddWorker.waiting_for_phone)
+    await message.answer("Xodimning telefon raqamini kiriting:")
+
+@router.message(AddWorker.waiting_for_phone)
+async def add_worker_phone(message: types.Message, state: FSMContext):
+    await state.update_data(worker_phone=message.text.strip())
+    await state.set_state(AddWorker.waiting_for_branch_name)
+    await message.answer("Ushbu xodim ustaxonangizning qaysi filialiga biriktiriladi?\n(Masalan: Chilonzor filial, Yunusobod. Yoki shunchaki bitta nom yozing):", reply_markup=types.ReplyKeyboardRemove())
+
+@router.message(AddWorker.waiting_for_branch_name)
+async def add_worker_branch_name(message: types.Message, state: FSMContext):
+    data = await state.get_data()
+    worker_id = data['worker_id']
+    worker_name = data['worker_name']
+    phone = data['worker_phone']
+    branch_name = message.text.strip()
+    
+    parent_id = None if message.from_user.id == CREATOR_ID else message.from_user.id
+    
+    ok = await add_worker(parent_id, worker_id, worker_name, phone, branch_name)
+    if ok:
+        await message.answer(f"✅ Xodim <b>{worker_name}</b> muvaffaqiyatli <b>{branch_name}</b> filialiga qo'shildi!\n\nEndi u ham botdan foydalansa, ishlari sizning statistikangizga aynan shu filial bilan uzatiladi.", reply_markup=main_menu_kb(message.from_user.id))
+    else:
+        await message.answer("❌ Xodimni qo'shib bo'lmadi. Ehtimol uning ID si allaqachon botda qandaydir maxsus ustuna bilan r'oyxatdan o'tgan bo'lishi mumkin.", reply_markup=main_menu_kb(message.from_user.id))
+        
+    await state.clear()

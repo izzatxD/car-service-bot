@@ -1,0 +1,804 @@
+import aiosqlite
+from aiogram import Router, F, types, Bot
+from aiogram.types import BufferedInputFile, InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.utils.keyboard import InlineKeyboardBuilder
+from aiogram.fsm.context import FSMContext
+from aiogram.exceptions import TelegramBadRequest
+
+from config import CREATOR_ID
+from db import DB_PATH, get_all_masters, get_master, get_daily_stats, get_monthly_stats, get_active_orders, export_orders_to_excel, add_master, get_all_time_stats, get_history_by_period, get_all_orders, fmt_dt
+from utils.states import AddMaster, SearchMaster, BroadcastState
+
+router = Router()
+
+# ─── Sahifadagi ustalar soni ────────────────────
+PAGE_SIZE = 10
+
+# ════════════════════════════════════════════════
+#  RENDER FUNCTIONS
+# ════════════════════════════════════════════════
+
+async def render_dashboard() -> tuple[str, InlineKeyboardMarkup]:
+    global_daily  = await get_daily_stats()
+    global_monthly = await get_monthly_stats()
+    masters = await get_all_masters()
+
+    active_masters = sum(1 for m in masters if m['is_active'])
+    blocked_masters = len(masters) - active_masters
+
+    text = (
+        "⚙️ <b>ADMIN PANEL</b>\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        "📅 <b>Bugun:</b>\n"
+        f"  📥 Qabul: <b>{global_daily['received_count']}</b>  "
+        f"  ✅ Topshirildi: <b>{global_daily['completed_count']}</b>\n"
+        f"  💰 Tushum: <b>{global_daily['completed_total']:,.0f} so'm</b>\n\n"
+        "📆 <b>Shu oy:</b>\n"
+        f"  📦 Faol buyurtmalar: <b>{global_monthly.get('active_count', 0)}</b>\n"
+        f"  💰 Tushum: <b>{global_monthly['completed_total']:,.0f} so'm</b>\n\n"
+        f"👨‍🔧 <b>Ustalar:</b>  🟢 Faol: <b>{active_masters}</b>  🔴 Bloklangan: <b>{blocked_masters}</b>  │ Jami: <b>{len(masters)}</b>\n"
+    )
+
+    builder = InlineKeyboardBuilder()
+    builder.row(
+        InlineKeyboardButton(text="👨‍🔧 Ustalar ro'yxati", callback_data="admin_masters_page_0"),
+        InlineKeyboardButton(text="🔍 Usta qidirish",      callback_data="admin_search_master"),
+    )
+    builder.row(
+        InlineKeyboardButton(text="📊 Analitika",    callback_data="admin_analytics"),
+        InlineKeyboardButton(text="📦 Faol Ishlar",  callback_data="admin_orders_all"),
+    )
+    builder.row(
+        InlineKeyboardButton(text="📤 Excel Eksport", callback_data="admin_export_xlsx"),
+        InlineKeyboardButton(text="➕ Usta qo'shish",  callback_data="admin_add_master"),
+    )
+    builder.row(
+        InlineKeyboardButton(text="📢 Barchaga xabar yuborish", callback_data="admin_broadcast"),
+    )
+
+    return text, builder.as_markup()
+
+
+async def render_masters_page(page: int) -> tuple[str, InlineKeyboardMarkup]:
+    masters = await get_all_masters()
+    total   = len(masters)
+    total_pages = max(1, (total + PAGE_SIZE - 1) // PAGE_SIZE)
+    page = max(0, min(page, total_pages - 1))
+
+    start = page * PAGE_SIZE
+    chunk = masters[start: start + PAGE_SIZE]
+
+    active_count   = sum(1 for m in masters if m['is_active'])
+    blocked_count  = total - active_count
+
+    text = (
+        f"👨‍🔧 <b>USTALAR RO'YXATI</b>  ({page + 1}/{total_pages} sahifa)\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        f"🟢 Faol: <b>{active_count}</b>   🔴 Bloklangan: <b>{blocked_count}</b>   Jami: <b>{total}</b>\n\n"
+        "<i>Usta profiliga kirish yoki blok/faol qilish uchun tugmani bosing:</i>"
+    )
+
+    builder = InlineKeyboardBuilder()
+
+    for m in chunk:
+        status_icon = "🟢" if m['is_active'] else "🔴"
+        name = m.get('full_name') or m.get('username') or f"ID:{m['telegram_id']}"
+        display = f"{status_icon} {name[:22]}"
+        toggle_label = "🔒 Bloklash" if m['is_active'] else "🔓 Faollashtirish"
+
+        builder.row(
+            InlineKeyboardButton(text=display,       callback_data=f"admin_master_{m['telegram_id']}"),
+            InlineKeyboardButton(text=toggle_label,  callback_data=f"admin_toggle_{m['telegram_id']}_page_{page}"),
+        )
+
+    nav_buttons = []
+    if page > 0:
+        nav_buttons.append(InlineKeyboardButton(text="◀ Oldingi", callback_data=f"admin_masters_page_{page - 1}"))
+    nav_buttons.append(InlineKeyboardButton(text=f"{page + 1}/{total_pages}", callback_data="admin_noop"))
+    if page < total_pages - 1:
+        nav_buttons.append(InlineKeyboardButton(text="Keyingi ▶", callback_data=f"admin_masters_page_{page + 1}"))
+
+    builder.row(*nav_buttons)
+    builder.row(
+        InlineKeyboardButton(text="🔍 Qidirish",   callback_data="admin_search_master"),
+        InlineKeyboardButton(text="🔙 Dashboard", callback_data="admin_dashboard"),
+    )
+
+    return text, builder.as_markup()
+
+
+async def render_master_profile(master_id: int) -> tuple[str, InlineKeyboardMarkup]:
+    master = await get_master(master_id)
+    if not master:
+        return "❌ Usta topilmadi.", InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="🔙 Orqaga", callback_data="admin_masters_page_0")
+        ]])
+
+    status = "🟢 FAOL" if master['is_active'] else "🔴 BLOKLANGAN"
+    name     = master.get('full_name') or "Noma'lum"
+    username = f"@{master['username']}" if master.get('username') else "—"
+
+    daily   = await get_daily_stats(master_id)
+    monthly = await get_monthly_stats(master_id)
+    # get_all_time_stats already imported from db at top
+    all_time = await get_all_time_stats(master_id)
+
+    text = (
+        f"{status}  <b>{name}</b>  {username}\n"
+        f"🆔 <code>{master_id}</code>\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        "📅 <b>Bugun:</b>\n"
+        f"  📥 Qabul: <b>{daily['received_count']}</b>  ✅ Topshiri: <b>{daily['completed_count']}</b>\n"
+        f"  💰 Tushum: <b>{daily['completed_total']:,.0f} s</b>  💵 Foyda: <b>{(daily['completed_total'] - daily['completed_cost']):,.0f} s</b>\n\n"
+        "📆 <b>Shu oy:</b>\n"
+        f"  📥 Qabul: <b>{monthly['received_count']}</b>  ✅ Topshiri: <b>{monthly['completed_count']}</b>\n"
+        f"  📦 Faol Ishlar: <b>{monthly['active_count']}</b>\n"
+        f"  💰 Tushum: <b>{monthly['completed_total']:,.0f} s</b>  💵 Foyda: <b>{(monthly['completed_total'] - monthly['completed_cost']):,.0f} s</b>\n\n"
+        "📈 <b>Umumiy (Barcha vaqt):</b>\n"
+        f"  👥 Jami xizmat ko'rsatilganlar: <b>{all_time['completed_count']}</b> ta mijoz\n"
+        f"  💰 Umumiy ishlagan summasi: <b>{all_time['completed_total']:,.0f} s</b>\n"
+        f"  💵 Umumiy foyda: <b>{(all_time['completed_total'] - all_time['completed_cost']):,.0f} s</b>\n"
+    )
+
+    toggle_label = "🔒 Bloklash" if master['is_active'] else "🔓 Faollashtirish"
+
+    builder = InlineKeyboardBuilder()
+    builder.row(InlineKeyboardButton(text="⏳ Faol Ishlari (Tugatmagan)", callback_data=f"admin_m_orders_{master_id}"))
+    builder.row(InlineKeyboardButton(text="✅ Topshirgan ishlari", callback_data=f"admin_m_history_menu_{master_id}"))
+    builder.row(
+        InlineKeyboardButton(text=toggle_label, callback_data=f"admin_toggle_{master_id}_profile"),
+        InlineKeyboardButton(text="🗑 O'chirish", callback_data=f"admin_del_ask_{master_id}"),
+    )
+    builder.row(InlineKeyboardButton(text="🔙 Ro'yxatga", callback_data="admin_masters_page_0"))
+
+    return text, builder.as_markup()
+
+
+async def render_active_orders(filter_type: str = "all", master_id: int = None) -> tuple[str, InlineKeyboardMarkup]:
+    all_orders = await get_active_orders(master_id)
+
+    if filter_type == "progress":
+        orders = [o for o in all_orders if o['status'] in ['qabul_qilindi', 'jarayonda']]
+    elif filter_type == "ready":
+        orders = [o for o in all_orders if o['status'] == 'tayyor']
+    else:
+        orders = all_orders
+
+    text = f"📦 <b>FAOL ISHLAR</b> ({len(orders)} ta)\n━━━━━━━━━━━━━━━━━━\n\n"
+
+    for o in orders[:25]:
+        st_icon = "🟡" if o['status'] == "jarayonda" else "🟢" if o['status'] == "tayyor" else "⚪"
+        master_tag = f"<b>M:</b>{o['master_id']} | " if not master_id else ""
+        st_text = o['status'].replace('_', ' ').capitalize()
+        text += (
+            f"{st_icon} <b>#{o['id']}</b> | {o['client_name']} | 🚗 {o['car_model']} ({o['car_number']})\n"
+            f"   └ {master_tag}{st_text} | 💰 {o['price']:,.0f} so'm\n\n"
+        )
+
+    if not orders:
+        text += "Ushbu filtrda faol ishlar topilmadi."
+
+    builder = InlineKeyboardBuilder()
+
+    f_all    = "🔘 Barchasi"  if filter_type == "all"      else "Barchasi"
+    f_prog   = "🔘 Jarayonda" if filter_type == "progress" else "Jarayonda"
+    f_ready  = "🔘 Tayyor"    if filter_type == "ready"    else "Tayyor"
+
+    master_param = f"_{master_id}" if master_id else ""
+    builder.row(
+        InlineKeyboardButton(text=f_all,   callback_data=f"admin_orders_all{master_param}"),
+        InlineKeyboardButton(text=f_prog,  callback_data=f"admin_orders_progress{master_param}"),
+        InlineKeyboardButton(text=f_ready, callback_data=f"admin_orders_ready{master_param}"),
+    )
+
+    back_cb = f"admin_master_{master_id}" if master_id else "admin_dashboard"
+    builder.row(InlineKeyboardButton(text="🔙 Orqaga", callback_data=back_cb))
+
+    return text, builder.as_markup()
+
+
+def _bar(value: int, max_value: int, length: int = 8) -> str:
+    if max_value == 0:
+        return "░" * length
+    filled = round(value / max_value * length)
+    return "█" * filled + "░" * (length - filled)
+
+
+async def render_analytics() -> tuple[str, InlineKeyboardMarkup]:
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+
+        # Top ustalar
+        cur = await db.execute("""
+            SELECT m.full_name, m.username, m.telegram_id,
+                   COUNT(o.id) as cnt, 
+                   COALESCE(SUM(o.price), 0) as rev,
+                   COALESCE(SUM(o.cost), 0) as cost_t
+            FROM orders o JOIN masters m ON o.master_id = m.telegram_id
+            WHERE o.status = 'topshirildi'
+            GROUP BY m.telegram_id ORDER BY (rev - cost_t) DESC LIMIT 5
+        """)
+        top_m = await cur.fetchall()
+
+        # Eng ko'p muammolar
+        cur = await db.execute(
+            "SELECT problem, COUNT(*) as c FROM orders GROUP BY problem ORDER BY c DESC LIMIT 5"
+        )
+        top_p = await cur.fetchall()
+
+        cur = await db.execute("SELECT COUNT(*) FROM orders")
+        total = (await cur.fetchone())[0]
+        cur = await db.execute("SELECT COUNT(*) FROM orders WHERE status = 'topshirildi'")
+        completed = (await cur.fetchone())[0]
+        cur = await db.execute("SELECT COUNT(*) FROM orders WHERE status NOT IN ('topshirildi','bekor')")
+        active = (await cur.fetchone())[0]
+        cur = await db.execute("SELECT COUNT(*) FROM orders WHERE status = 'bekor'")
+        cancelled = (await cur.fetchone())[0]
+        
+        cur = await db.execute("SELECT COALESCE(SUM(price - cost), 0) FROM orders WHERE status = 'topshirildi'")
+        total_profit = (await cur.fetchone())[0]
+
+        cur = await db.execute("""
+            SELECT strftime('%Y-%m', created_at) as month,
+                   COUNT(*) as cnt,
+                   COALESCE(SUM(CASE WHEN status='topshirildi' THEN price ELSE 0 END), 0) as rev,
+                   COALESCE(SUM(CASE WHEN status='topshirildi' THEN cost ELSE 0 END), 0) as cost_t
+            FROM orders
+            GROUP BY month ORDER BY month DESC LIMIT 3
+        """)
+        monthly_rows = await cur.fetchall()
+
+    ratio = (completed / total * 100) if total > 0 else 0
+    max_rev = max(((m['rev'] - m['cost_t']) for m in top_m), default=1) or 1
+    max_cnt = max((p['c'] for p in top_p), default=1) or 1
+
+    text = "📊 <b>ANALITIKA</b>\n━━━━━━━━━━━━━━━━━━\n\n"
+
+    text += (
+        "<b>Umumiy:</b>\n"
+        f"  📋 Jami: <b>{total}</b>  ✅ Bitdi: <b>{completed}</b>\n  "
+        f"⏳ Faol: <b>{active}</b>  ❌ Bekor: <b>{cancelled}</b>\n"
+        f"  💵 Jami Foyda: <b>{total_profit:,.0f} so'm</b>\n"
+        f"  Konversiya: <b>{ratio:.1f}%</b> [{_bar(completed, total)}]\n\n"
+    )
+
+    if monthly_rows:
+        text += "📅 <b>Oxirgi oylar:</b>\n"
+        for row in reversed(monthly_rows):
+            profit_m = row['rev'] - row['cost_t']
+            text += f"  {row['month']}  —  {row['cnt']} ta  💵 {profit_m:,.0f} s\n"
+        text += "\n"
+
+    if top_m:
+        text += "🏆 <b>Top ustalar (Foyda bo'yicha):</b>\n"
+        for i, m in enumerate(top_m, 1):
+            name = (m['full_name'] or m['username'] or f"ID:{m['telegram_id']}")[:18]
+            profit = m['rev'] - m['cost_t']
+            bar  = _bar(int(profit), int(max_rev))
+            text += f"  {i}. <b>{name}</b>\n     [{bar}] {profit:,.0f} so'm ({m['cnt']} ta)\n"
+        text += "\n"
+    else:
+        text += "🏆 <b>Top ustalar:</b> ma'lumot yo'q\n\n"
+
+    if top_p:
+        text += "🔧 <b>Eng ko'p muammolar:</b>\n"
+        for p in top_p:
+            bar = _bar(p['c'], max_cnt)
+            text += f"  [{bar}] {p['problem']} — {p['c']}x\n"
+
+    builder = InlineKeyboardBuilder()
+    builder.row(InlineKeyboardButton(text="🔙 Dashboard", callback_data="admin_dashboard"))
+    return text, builder.as_markup()
+
+
+# ════════════════════════════════════════════════
+#  ROUTER HANDLERS
+# ════════════════════════════════════════════════
+
+@router.message(F.text == "⚙ Admin Panel")
+async def open_admin_dashboard(message: types.Message):
+    if message.from_user.id != CREATOR_ID:
+        return
+    text, markup = await render_dashboard()
+    await message.answer(text, reply_markup=markup)
+
+@router.callback_query(F.data == "admin_dashboard")
+async def cb_admin_dashboard(cb: types.CallbackQuery):
+    if cb.from_user.id != CREATOR_ID:
+        return
+    text, markup = await render_dashboard()
+    await _safe_edit(cb, text, markup)
+
+
+@router.callback_query(F.data.startswith("admin_masters_page_"))
+async def cb_masters_page(cb: types.CallbackQuery):
+    if cb.from_user.id != CREATOR_ID:
+        return
+    page = int(cb.data.split("_")[-1])
+    text, markup = await render_masters_page(page)
+    await _safe_edit(cb, text, markup)
+
+
+@router.callback_query(F.data.startswith("admin_master_"))
+async def cb_admin_master_detail(cb: types.CallbackQuery):
+    if cb.from_user.id != CREATOR_ID:
+        return
+    master_id = int(cb.data.split("_")[-1])
+    text, markup = await render_master_profile(master_id)
+    await _safe_edit(cb, text, markup)
+
+
+@router.callback_query(F.data.startswith("admin_toggle_"))
+async def cb_admin_toggle_master(cb: types.CallbackQuery):
+    if cb.from_user.id != CREATOR_ID:
+        return
+
+    parts = cb.data.split("_")
+    master_id = int(parts[2])
+    source    = "_".join(parts[3:])
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "UPDATE masters SET is_active = CASE WHEN is_active = 1 THEN 0 ELSE 1 END WHERE telegram_id = ?",
+            (master_id,)
+        )
+        await db.commit()
+
+    if source == "profile":
+        text, markup = await render_master_profile(master_id)
+    elif source.startswith("page_"):
+        page = int(source.split("_")[1])
+        text, markup = await render_masters_page(page)
+    else:
+        text, markup = await render_dashboard()
+
+    await _safe_edit(cb, text, markup)
+    await cb.answer("✅ Holat yangilandi!")
+
+
+@router.callback_query(F.data.startswith("admin_del_ask_"))
+async def cb_admin_delete_ask(cb: types.CallbackQuery):
+    if cb.from_user.id != CREATOR_ID:
+        return
+    master_id = int(cb.data.split("_")[-1])
+    builder = InlineKeyboardBuilder()
+    builder.row(
+        InlineKeyboardButton(text="✅ Ha, o'chirilsin", callback_data=f"admin_del_yes_{master_id}"),
+        InlineKeyboardButton(text="❌ Bekor",           callback_data=f"admin_master_{master_id}"),
+    )
+    await _safe_edit(
+        cb,
+        f"⚠️ <b>Diqqat!</b>\nID <code>{master_id}</code> li ustani o'chirmoqchimisiz?\n"
+        "<i>Bu usta bazadan butunlay o'chiriladi.</i>",
+        builder.as_markup()
+    )
+
+
+@router.callback_query(F.data.startswith("admin_del_yes_"))
+async def cb_admin_delete_yes(cb: types.CallbackQuery):
+    if cb.from_user.id != CREATOR_ID:
+        return
+    master_id = int(cb.data.split("_")[-1])
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("DELETE FROM masters WHERE telegram_id = ?", (master_id,))
+        await db.commit()
+    await cb.answer("🗑 Usta o'chirildi!", show_alert=True)
+    text, markup = await render_masters_page(0)
+    await _safe_edit(cb, text, markup)
+
+
+@router.callback_query(F.data.startswith("admin_orders_"))
+async def cb_admin_orders_monitor(cb: types.CallbackQuery):
+    if cb.from_user.id != CREATOR_ID:
+        return
+
+    data        = cb.data.replace("admin_orders_", "")
+    parts       = data.split("_")
+    filter_type = parts[0]
+    master_id   = int(parts[1]) if len(parts) > 1 else None
+
+    text, markup = await render_active_orders(filter_type, master_id)
+    await _safe_edit(cb, text, markup)
+
+
+@router.callback_query(F.data.startswith("admin_m_orders_"))
+async def cb_admin_master_orders(cb: types.CallbackQuery):
+    if cb.from_user.id != CREATOR_ID:
+        return
+    master_id = int(cb.data.split("_")[-1])
+    text, markup = await render_active_orders("all", master_id)
+    await _safe_edit(cb, text, markup)
+
+@router.callback_query(F.data.startswith("admin_m_history_menu_"))
+async def cb_admin_master_history_menu(cb: types.CallbackQuery):
+    if cb.from_user.id != CREATOR_ID: return
+    master_id = int(cb.data.split("_")[-1])
+    
+    text = "✅ <b>Ustaning topshirgan ishlari</b>\nQaysi vaqt oralig'ida ko'rmoqchisiz?"
+    
+    builder = InlineKeyboardBuilder()
+    builder.row(
+        InlineKeyboardButton(text="📅 Kunlik", callback_data=f"admin_m_hist_today_{master_id}"),
+        InlineKeyboardButton(text="🗓 Haftalik", callback_data=f"admin_m_hist_weekly_{master_id}")
+    )
+    builder.row(
+        InlineKeyboardButton(text="📆 Oylik", callback_data=f"admin_m_hist_monthly_{master_id}"),
+        InlineKeyboardButton(text="📈 Umumiy", callback_data=f"admin_m_hist_all_{master_id}")
+    )
+    builder.row(InlineKeyboardButton(text="📥 Barchasini saqlash (Excel)", callback_data=f"admin_m_hist_excel_{master_id}"))
+    builder.row(InlineKeyboardButton(text="🔙 Orqaga", callback_data=f"admin_master_{master_id}"))
+    
+    await _safe_edit(cb, text, builder.as_markup())
+
+@router.callback_query(F.data.startswith("admin_m_hist_"))
+async def cb_admin_m_hist(cb: types.CallbackQuery):
+    if cb.from_user.id != CREATOR_ID: return
+    parts = cb.data.split("_")
+    period = parts[3]
+    master_id = int(parts[4])
+    
+    if period == "excel":
+        await cb.answer("⏳ Excel fayl tayyorlanmoqda...", show_alert=False)
+        # It's better to reuse mechanic's excel export logic
+        from openpyxl import Workbook
+        from openpyxl.styles import Font, Alignment, PatternFill
+        import io
+        orders = await get_all_orders(master_id)
+        if not orders:
+            return await cb.message.answer("😕 Bazada ushbu ustaning hali mijozlari yo'q.")
+        
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "Mijozlar Bazasi"
+        
+        headers = ["T/r", "Qabul Qilingan Vaqt", "Status", "Mijoz Ismi", "Telefon", "Mashina Modeli", "Davlat Raqami", "Probeg", "Muammo", "Narx", "Xarajat", "Sof Foyda"]
+        ws.append(headers)
+        
+        for k, h in enumerate(headers, 1):
+            cell = ws.cell(row=1, column=k)
+            cell.font = Font(bold=True)
+            cell.fill = PatternFill(start_color="cccccc", end_color="cccccc", fill_type="solid")
+            
+        for i, o in enumerate(orders, 1):
+            profit = (o['price'] or 0) - (o['cost'] or 0)
+            ws.append([
+                i,
+                o['created_at'],
+                o['status'],
+                o['client_name'],
+                o['client_phone'],
+                o['car_model'],
+                o['car_number'],
+                o.get('mileage', ''),
+                o['problem'],
+                o['price'],
+                o['cost'],
+                profit
+            ])
+            
+        for col in ws.columns:
+            max_length = 0
+            column = col[0].column_letter
+            for cell in col:
+                try:
+                    if len(str(cell.value)) > max_length:
+                        max_length = len(str(cell.value))
+                except:
+                    pass
+            adjusted_width = (max_length + 2)
+            ws.column_dimensions[column].width = min(adjusted_width, 40)
+            
+        out = io.BytesIO()
+        wb.save(out)
+        out.seek(0)
+        
+        from datetime import datetime
+        date_str = datetime.now().strftime('%Y-%m-%d')
+        doc = BufferedInputFile(out.read(), filename=f"Mijozlar_Ustasi_{master_id}_{date_str}.xlsx")
+        await cb.message.answer_document(doc, caption=f"📊 Ustaga tegishli barcha buyurtmalar bazasi")
+        await cb.answer()
+        return
+
+    # get_history_by_period and fmt_dt already imported from db at top
+    history = await get_history_by_period(master_id, period)
+    
+    label_map = {"today": "Kunlik", "weekly": "Haftalik", "monthly": "Oylik", "all": "Umumiy barcha"}
+    label = label_map.get(period, period)
+    
+    if not history:
+        await cb.answer(f"😕 {label} ro'yxatda hali yakunlagan ishlari yo'q.", show_alert=True)
+        return
+        
+    text = f"✅ <b>Ustaning {label} topshirgan ishlari:</b>\n━━━━━━━━━━━━━━━━━━━━━━\n\n"
+    for i, o in enumerate(history, 1):
+        # Limit to 50 exactly in telegram text, rest user can see in excel
+        if i > 50:
+            break
+        text += (
+            f"<b>{i}) {o['client_name']}</b>\n"
+            f"   🚗 {o['car_model']} ({o.get('car_number') or '-'}) | 🔧 {o['problem']}\n"
+            f"   💰 {o['price']:,.0f} so'm | 📅 {fmt_dt(o['created_at'])}\n\n"
+        )
+    
+    if len(history) > 50:
+        text += f"\n... jami {len(history)} ta ish. Hammasini ko'rish uchun Excel formatda yuklab oling.\n"
+    elif len(text) > 4000:
+        text = text[:4000] + "\n... (davomi bor)"
+        
+    builder = InlineKeyboardBuilder()
+    builder.row(InlineKeyboardButton(text="🔙 Orqaga", callback_data=f"admin_m_history_menu_{master_id}"))
+    
+    await _safe_edit(cb, text, builder.as_markup())
+
+
+
+@router.callback_query(F.data == "admin_analytics")
+async def cb_admin_analytics(cb: types.CallbackQuery):
+    if cb.from_user.id != CREATOR_ID:
+        return
+    text, markup = await render_analytics()
+    await _safe_edit(cb, text, markup)
+
+
+@router.callback_query(F.data == "admin_export_xlsx")
+async def cb_admin_export(cb: types.CallbackQuery):
+    if cb.from_user.id != CREATOR_ID:
+        return
+
+    await cb.answer("📊 Excel fayl tayyorlanmoqda...", show_alert=True)
+
+    from datetime import datetime
+    file_bytes = await export_orders_to_excel()
+    date_str  = datetime.now().strftime('%Y-%m-%d')
+    doc       = BufferedInputFile(file_bytes, filename=f"CRM_Orders_{date_str}.xlsx")
+    await cb.message.answer_document(doc, caption=f"📊 Barcha buyurtmalar bazasi\nSana: {date_str}")
+
+
+@router.callback_query(F.data == "admin_noop")
+async def cb_noop(cb: types.CallbackQuery):
+    await cb.answer()
+
+
+# ════════════════════════════════════════════════
+#  USTA QIDIRISH — FSM FLOW
+# ════════════════════════════════════════════════
+@router.callback_query(F.data == "admin_search_master")
+async def cb_search_master_start(cb: types.CallbackQuery, state: FSMContext):
+    if cb.from_user.id != CREATOR_ID:
+        return
+    await state.set_state(SearchMaster.waiting_for_query)
+    await cb.message.answer(
+        "🔍 <b>Usta Qidirish</b>\n\n"
+        "Ustaning <b>Telegram ID</b> raqamini yoki <b>ismini</b> kiriting:\n"
+        "<i>Bekor qilish: «❌ Bekor qilish»</i>"
+    )
+    await cb.answer()
+
+
+@router.message(SearchMaster.waiting_for_query)
+async def process_search_master(message: types.Message, state: FSMContext):
+    if message.from_user.id != CREATOR_ID:
+        return
+
+    query = message.text.strip()
+    if query in ["❌ Bekor qilish", "🏠 Asosiy menyu", "⚙ Admin Panel"]:
+        await state.clear()
+        return
+
+    await state.clear()
+    masters = await get_all_masters()
+
+    if query.isdigit():
+        results = [m for m in masters if str(m['telegram_id']) == query]
+    else:
+        q_lower = query.lower()
+        results = [
+            m for m in masters
+            if q_lower in (m.get('full_name') or '').lower()
+            or q_lower in (m.get('username') or '').lower()
+        ]
+
+    if not results:
+        builder = InlineKeyboardBuilder()
+        builder.row(
+            InlineKeyboardButton(text="🔍 Qayta qidirish", callback_data="admin_search_master"),
+            InlineKeyboardButton(text="🔙 Dashboard",       callback_data="admin_dashboard"),
+        )
+        await message.answer(
+            f"😕 <b>«{query}»</b> bo'yicha usta topilmadi.",
+            reply_markup=builder.as_markup()
+        )
+        return
+
+    if len(results) == 1:
+        text, markup = await render_master_profile(results[0]['telegram_id'])
+        await message.answer(text, reply_markup=markup)
+        return
+
+    text = f"🔍 <b>«{query}»</b> — {len(results)} ta natija:\n━━━━━━━━━━━━━━━━━━\n"
+    builder = InlineKeyboardBuilder()
+    for m in results[:20]:
+        status_icon = "🟢" if m['is_active'] else "🔴"
+        name = m.get('full_name') or m.get('username') or f"ID:{m['telegram_id']}"
+        builder.row(
+            InlineKeyboardButton(
+                text=f"{status_icon} {name[:25]}",
+                callback_data=f"admin_master_{m['telegram_id']}"
+            )
+        )
+    builder.row(
+        InlineKeyboardButton(text="🔍 Qayta qidirish", callback_data="admin_search_master"),
+        InlineKeyboardButton(text="🔙 Dashboard",       callback_data="admin_dashboard"),
+    )
+    await message.answer(text, reply_markup=builder.as_markup())
+
+
+# ════════════════════════════════════════════════
+#  USTA QO'SHISH — FSM FLOW
+# ════════════════════════════════════════════════
+@router.callback_query(F.data == "admin_add_master")
+async def cb_admin_add_master(cb: types.CallbackQuery, state: FSMContext):
+    if cb.from_user.id != CREATOR_ID:
+        return
+
+    await state.set_state(AddMaster.waiting_for_id)
+    await cb.message.answer(
+        "➕ <b>Yangi Usta Qo'shish</b>\n\n"
+        "Qo'shmoqchi bo'lgan ustaning <b>Telegram ID</b> raqamini kiriting.\n\n"
+        "💡 <i>Foydalanuvchi o'z ID sini bilmasa, @userinfobot ga /start yubortiring.</i>\n\n"
+        "Bekor qilish: «❌ Bekor qilish»"
+    )
+    await cb.answer()
+
+@router.message(AddMaster.waiting_for_id)
+async def process_add_master_id(message: types.Message, state: FSMContext):
+    if message.from_user.id != CREATOR_ID:
+        return
+
+    text = message.text.strip()
+    if text in ["❌ Bekor qilish", "🏠 Asosiy menyu", "⚙ Admin Panel"]:
+        await state.clear()
+        return
+
+    if not text.isdigit():
+        await message.answer("❌ Faqat raqam kiriting! Masalan: <code>123456789</code>")
+        return
+
+    uid = int(text)
+    existing = await get_master(uid)
+    if existing:
+        status = "🟢 Faol" if existing['is_active'] else "🔴 Bloklangan"
+        name   = existing.get('full_name') or existing.get('username') or '—'
+        await message.answer(
+            f"⚠️ Bu usta allaqachon bazada mavjud!\n"
+            f"👤 <b>{name}</b> — {status}"
+        )
+        await state.clear()
+        return
+
+    bot: Bot = message.bot
+    chat_found = False
+    full_name  = ""
+    username   = ""
+
+    try:
+        chat = await bot.get_chat(uid)
+        if chat.id == uid and str(chat.type) in ("private", "ChatType.PRIVATE"):
+            full_name  = chat.full_name or ""
+            username   = chat.username or ""
+            chat_found = True
+    except Exception:
+        chat_found = False
+
+    builder = InlineKeyboardBuilder()
+    builder.row(
+        InlineKeyboardButton(text="✅ Ha, qo'shish", callback_data=f"admin_confirm_add_{uid}"),
+        InlineKeyboardButton(text="❌ Bekor",         callback_data="admin_cancel_add"),
+    )
+
+    await state.update_data(uid=uid, full_name=full_name, username=username)
+    await state.set_state(AddMaster.confirming)
+
+    if chat_found:
+        await message.answer(
+            f"👤 <b>Topildi!</b>\n\n"
+            f"Ism: <b>{full_name or '—'}</b>\n"
+            f"Username: {'@' + username if username else '—'}\n"
+            f"ID: <code>{uid}</code>\n\n"
+            f"Ushbu foydalanuvchini usta sifatida qo'shishni tasdiqlaysizmi?",
+            reply_markup=builder.as_markup()
+        )
+    else:
+        await message.answer(
+            f"⚠️ <b>Foydalanuvchi aniqlanmadi</b>\n\n"
+            f"ID <code>{uid}</code> li foydalanuvchi bot bilan hali muloqot qilmagan yoki mavjud emas.\n"
+            f"Baribir qo'shishni xohlaysizmi?\n",
+            reply_markup=builder.as_markup()
+        )
+
+@router.callback_query(F.data.startswith("admin_confirm_add_"))
+async def cb_confirm_add_master(cb: types.CallbackQuery, state: FSMContext):
+    if cb.from_user.id != CREATOR_ID:
+        return
+
+    uid = int(cb.data.split("_")[-1])
+    data = await state.get_data()
+
+    full_name = data.get("full_name", "")
+    username  = data.get("username", "")
+
+    success = await add_master(uid, full_name=full_name or None, username=username or None)
+
+    if success:
+        name = full_name or (f"@{username}" if username else f"ID:{uid}")
+        await cb.message.edit_text(
+            f"✅ <b>{name}</b> muvaffaqiyatli qo'shildi!\n"
+            f"🆔 <code>{uid}</code>\n"
+        )
+    else:
+        await cb.message.edit_text("❌ Xatolik yuz berdi yoki usta allaqachon mavjud.")
+
+    await state.clear()
+    await cb.answer()
+
+@router.callback_query(F.data == "admin_cancel_add")
+async def cb_cancel_add_master(cb: types.CallbackQuery, state: FSMContext):
+    await state.clear()
+    await cb.message.edit_text("❌ Usta qo'shish bekor qilindi.")
+    await cb.answer()
+
+# ════════════════════════════════════════════════
+#  BROADCAST 
+# ════════════════════════════════════════════════
+@router.callback_query(F.data == "admin_broadcast")
+async def cb_admin_broadcast_start(cb: types.CallbackQuery, state: FSMContext):
+    if cb.from_user.id != CREATOR_ID:
+        return
+        
+    await state.set_state(BroadcastState.waiting_for_message)
+    await cb.message.answer(
+        "📢 <b>Barcha ustalarga xabar yuborish</b>\n\n"
+        "Yubormoqchi bo'lgan xabaringizni yozing yoki rasm/video jo'nating.\n"
+        "<i>Bekor qilish: «❌ Bekor qilish»</i>"
+    )
+    await cb.answer()
+
+@router.message(BroadcastState.waiting_for_message)
+async def process_broadcast_message(message: types.Message, state: FSMContext):
+    if message.from_user.id != CREATOR_ID:
+        return
+        
+    if message.text in ["❌ Bekor qilish", "🏠 Asosiy menyu", "⚙ Admin Panel"]:
+        await state.clear()
+        return await message.answer("❌ Xabar yuborish bekor qilindi.")
+        
+    masters = await get_all_masters()
+    active_masters = [m for m in masters if m['is_active']]
+    
+    if not active_masters:
+        await state.clear()
+        return await message.answer("⚠️ Baza bo'sh yoki faol ustalar topilmadi.")
+        
+    sent_count = 0
+    await message.answer("⏳ Xabarlar yuborilmoqda, kuting...")
+    
+    for m in active_masters:
+        try:
+            await message.copy_to(chat_id=m['telegram_id'])
+            sent_count += 1
+        except Exception:
+            pass
+            
+    await state.clear()
+    await message.answer(
+        f"✅ <b>Xabar yuborish yakunlandi!</b>\n"
+        f"Jami yuborildi: {sent_count} ta ustaga (Mavjud: {len(active_masters)} ta)"
+    )
+
+async def _safe_edit(cb: types.CallbackQuery, text: str, markup: InlineKeyboardMarkup):
+    try:
+        await cb.message.edit_text(text, reply_markup=markup)
+    except TelegramBadRequest:
+        pass
+    finally:
+        await cb.answer()

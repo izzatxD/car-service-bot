@@ -1,0 +1,819 @@
+import aiosqlite
+import os
+from datetime import datetime, timezone, timedelta
+import csv
+import openpyxl
+
+from config import DATABASE_PATH as DB_PATH
+
+# ─── Toshkent vaqti (UTC+5) ───────────────────
+TZ_UZB = timezone(timedelta(hours=5))
+
+def now_local() -> str:
+    """Hozirgi vaqtni Toshkent zonasida qaytaradi: '2026-03-01 00:26:00'"""
+    return datetime.now(TZ_UZB).strftime("%Y-%m-%d %H:%M:%S")
+
+def fmt_dt(raw: str | None) -> str:
+    """Bazadagi sana/vaqt qatorini chiroyli ko'rinishga keltiradi."""
+    if not raw:
+        return "—"
+    try:
+        dt = datetime.fromisoformat(raw)
+        return dt.strftime("%d.%m.%Y %H:%M")
+    except Exception:
+        return raw
+
+async def init_db():
+    async with aiosqlite.connect(DB_PATH) as db:
+        # Ustalar jadvali
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS masters (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                telegram_id INTEGER UNIQUE,
+                full_name TEXT,
+                username TEXT,
+                phone TEXT DEFAULT '',
+                workshop_name TEXT DEFAULT '',
+                address TEXT DEFAULT NULL,
+                reminder_time TEXT DEFAULT '09:00',
+                reminders_enabled INTEGER DEFAULT 0,
+                default_warranty_days INTEGER DEFAULT 0,
+                is_active INTEGER DEFAULT 1,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        # Eski DB uchun yangi ustunni qo'shish (xatolikni e'tiborsiz qoldirish)
+        try:
+            await db.execute("ALTER TABLE masters ADD COLUMN reminders_enabled INTEGER DEFAULT 0")
+        except Exception:
+            pass
+        try:
+            await db.execute("ALTER TABLE orders ADD COLUMN mileage TEXT DEFAULT ''")
+        except Exception:
+            pass
+        try:
+            await db.execute("ALTER TABLE orders ADD COLUMN next_service_date DATE")
+        except Exception:
+            pass
+        try:
+            await db.execute("ALTER TABLE masters ADD COLUMN role TEXT DEFAULT 'boss'")
+        except Exception:
+            pass
+        try:
+            await db.execute("ALTER TABLE masters ADD COLUMN branch_name TEXT DEFAULT ''")
+        except Exception:
+            pass
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS orders (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                master_id INTEGER,
+                client_name TEXT NOT NULL,
+                client_phone TEXT NOT NULL,
+                car_model TEXT NOT NULL,
+                car_number TEXT DEFAULT '',
+                problem TEXT NOT NULL,
+                car_condition TEXT NOT NULL,
+                price REAL NOT NULL,
+                cost REAL DEFAULT 0,
+                warranty TEXT NOT NULL,
+                warranty_until DATE,
+                next_service_date DATE,
+                security_code TEXT DEFAULT '',
+                status TEXT DEFAULT 'qabul_qilindi',
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                completed_at DATETIME,
+                payment_method TEXT DEFAULT 'naqd',
+                paid_amount REAL DEFAULT 0
+            )
+        """)
+        await db.commit()
+
+# ═══════════════════════════════════════════════
+#  USTALAR (MASTERS) LOGIKASI
+# ═══════════════════════════════════════════════
+
+async def add_master(telegram_id: int, full_name: str | None = None, username: str | None = None) -> bool:
+    """Yangi ustani qo'shish yoki ma'lumotlarini yangilash."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        try:
+            await db.execute(
+                """INSERT INTO masters (telegram_id, full_name, username, is_active) 
+                   VALUES (?, ?, ?, 1) 
+                   ON CONFLICT(telegram_id) DO UPDATE SET 
+                   full_name = COALESCE(?, masters.full_name),
+                   username = COALESCE(?, masters.username),
+                   is_active = 1""", 
+                (telegram_id, full_name, username, full_name, username)
+            )
+            await db.commit()
+            return True
+        except Exception:
+            return False
+
+async def get_master(telegram_id: int) -> dict | None:
+    """Ustani ID bo'yicha olish."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute("SELECT * FROM masters WHERE telegram_id = ?", (telegram_id,))
+        row = await cursor.fetchone()
+        return dict(row) if row else None
+
+async def block_master(telegram_id: int):
+    """Ustani bloklash."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("UPDATE masters SET is_active = 0 WHERE telegram_id = ?", (telegram_id,))
+        await db.commit()
+
+async def get_all_masters() -> list[dict]:
+    """Barcha ustalarni ro'yxatini olish."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute("SELECT * FROM masters ORDER BY created_at DESC")
+        rows = await cursor.fetchall()
+        return [dict(row) for row in rows]
+
+async def update_master_info(telegram_id: int, phone: str = "", workshop_name: str = "") -> bool:
+    """Ustaning ixtiyoriy kontakt ma'lumotlarini yangilash (PDF uchun)."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        try:
+            await db.execute(
+                "UPDATE masters SET phone = ?, workshop_name = ? WHERE telegram_id = ?",
+                (phone.strip(), workshop_name.strip(), telegram_id)
+            )
+            await db.commit()
+            return True
+        except Exception:
+            return False
+
+async def get_workers(parent_id: int) -> list[dict]:
+    """Boshliqning barcha shogirdlarini (ishchilarni) olish."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute("SELECT * FROM masters WHERE parent_id = ? ORDER BY created_at DESC", (parent_id,))
+        rows = await cursor.fetchall()
+        return [dict(row) for row in rows]
+
+async def get_branches(master_id: int) -> list[str]:
+    """Boshliq va uning shogirdlariga tegishli (mavjud) barcha filiallarni olish."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            "SELECT DISTINCT branch_name FROM masters WHERE (telegram_id = ? OR parent_id = ?) AND branch_name != '' AND branch_name IS NOT NULL", 
+            (master_id, master_id)
+        )
+        rows = await cursor.fetchall()
+        return [r[0] for r in rows if r[0]]
+
+async def add_worker(parent_id: int, telegram_id: int, full_name: str, phone: str, branch_name: str) -> bool:
+    """Boshliq o'ziga yangi shogird qo'shishi."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        try:
+            await db.execute(
+                """INSERT INTO masters (telegram_id, full_name, phone, role, parent_id, branch_name, is_active) 
+                   VALUES (?, ?, ?, 'worker', ?, ?, 1)""", 
+                (telegram_id, full_name, phone, parent_id, branch_name)
+            )
+            await db.commit()
+            return True
+        except Exception:
+            return False
+
+async def update_master_settings(telegram_id: int, **kwargs) -> bool:
+    """Ustaning o'zgartirilgan sozlamalarini (settings) bazaga yozish."""
+    valid_keys = ['workshop_name', 'address', 'phone', 'reminder_time', 'default_warranty_days', 'reminders_enabled']
+    updates = []
+    params = []
+    
+    for key, value in kwargs.items():
+        if key in valid_keys:
+            updates.append(f"{key} = ?")
+            params.append(value)
+            
+    if not updates:
+        return False
+        
+    async with aiosqlite.connect(DB_PATH) as db:
+        sql = f"UPDATE masters SET {', '.join(updates)} WHERE telegram_id = ?"
+        params.append(telegram_id)
+        await db.execute(sql, tuple(params))
+        await db.commit()
+        return True
+
+# ═══════════════════════════════════════════════
+#  BUYURTMALAR (ORDERS) LOGIKASI
+# ═══════════════════════════════════════════════
+
+async def add_order(
+    master_id: int, client_name: str, client_phone: str,
+    car_model: str, car_number: str, mileage: str, problem: str, car_condition: str,
+    price: float, cost: float, warranty: str, warranty_until: str | None, next_service_date: str | None
+) -> int:
+    """Yangi buyurtma qo'shish."""
+    code = os.urandom(3).hex().upper()
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            """INSERT INTO orders (
+                master_id, client_name, client_phone, car_model, car_number, mileage,
+                problem, car_condition, price, cost, warranty, warranty_until, next_service_date, security_code, created_at
+               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (master_id, client_name, client_phone, car_model, car_number, mileage,
+             problem, car_condition, price, cost, warranty, warranty_until, next_service_date, code, now_local())
+        )
+        await db.commit()
+        return cursor.lastrowid
+
+async def get_order(order_id: int, master_id: int | None = None) -> dict | None:
+    """Buyurtmani id (va master_id) bo'yicha olish."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        query = "SELECT * FROM orders WHERE id = ?"
+        params = [order_id]
+        if master_id:
+            query += " AND master_id = ?"
+            params.append(master_id)
+            
+        cursor = await db.execute(query, tuple(params))
+        row = await cursor.fetchone()
+        return dict(row) if row else None
+
+async def get_masters_with_reminders() -> list[dict]:
+    """Eslatmalarni yoqib qo'ygan ustalarni olish."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute("SELECT * FROM masters WHERE reminders_enabled = 1 AND is_active = 1")
+        rows = await cursor.fetchall()
+        return [dict(row) for row in rows]
+
+async def get_overdue_orders(master_id: int) -> list[dict]:
+    """Ustaning 3 kundan oshgan, lekin hali topshirilmagan ishlarini olish."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        query = """
+            SELECT * FROM orders 
+            WHERE master_id IN (SELECT telegram_id FROM masters WHERE telegram_id = ? OR parent_id = ?) 
+              AND status != 'topshirildi' 
+              AND status != 'bekor_qilindi'
+              AND created_at <= datetime('now', '-3 days', 'localtime')
+            ORDER BY created_at ASC
+        """
+        cursor = await db.execute(query, (master_id, master_id))
+        rows = await cursor.fetchall()
+        return [dict(row) for row in rows]
+
+async def get_weekly_history(master_id: int) -> list[dict]:
+    """Oxirgi 7 kundagi hamma statusdagi buyurtmalarni olish."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        query = """
+            SELECT * FROM orders 
+            WHERE master_id IN (SELECT telegram_id FROM masters WHERE telegram_id = ? OR parent_id = ?) 
+              AND created_at >= datetime('now', '-7 days', 'localtime')
+            ORDER BY created_at DESC
+        """
+        cursor = await db.execute(query, (master_id, master_id))
+        rows = await cursor.fetchall()
+        return [dict(row) for row in rows]
+
+async def get_all_orders(master_id: int) -> list[dict]:
+    """Ustaning barcha mijozlarini (tarix uchun) chiqarib berish."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        query = "SELECT * FROM orders WHERE master_id IN (SELECT telegram_id FROM masters WHERE telegram_id = ? OR parent_id = ?) ORDER BY created_at DESC"
+        cursor = await db.execute(query, (master_id, master_id))
+        rows = await cursor.fetchall()
+        return [dict(row) for row in rows]
+
+async def update_order_status(order_id: int, status: str, master_id: int | None = None):
+    """Buyurtma holatini yangilash — completed_at ni Toshkent vaqtida saqlaydi."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        query = "UPDATE orders SET status = ?"
+        params = [status]
+        
+        if status == "topshirildi":
+            query += ", completed_at = ?"
+            params.append(now_local())
+            
+        query += " WHERE id = ?"
+        params.append(order_id)
+        
+        if master_id is not None:
+            query += " AND master_id = ?"
+            params.append(master_id)
+            
+        await db.execute(query, tuple(params))
+        await db.commit()
+
+async def complete_order(order_id: int, payment_method: str, paid_amount: float, master_id: int | None = None):
+    """Buyurtmani topshirish va to'lov usulini saqlash."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        query = "UPDATE orders SET status = 'topshirildi', completed_at = ?, payment_method = ?, paid_amount = ? WHERE id = ?"
+        params = [now_local(), payment_method, paid_amount, order_id]
+        
+        if master_id is not None:
+            query += " AND master_id = ?"
+            params.append(master_id)
+            
+        await db.execute(query, tuple(params))
+        await db.commit()
+
+async def get_debtors(master_id: int | None = None, branch_name: str | None = None, is_personal: bool = False) -> list[dict]:
+    """Qarzdorlarni ro'yxatini olish (paid_amount < price)."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        sql = "SELECT * FROM orders WHERE status = 'topshirildi' AND payment_method = 'nasiya' AND paid_amount < price"
+        params = []
+        
+        if master_id:
+            if is_personal:
+                sql += " AND master_id = ?"
+                params.append(master_id)
+            elif branch_name:
+                sql += " AND master_id IN (SELECT telegram_id FROM masters WHERE (telegram_id = ? OR parent_id = ?) AND branch_name = ?)"
+                params.extend([master_id, master_id, branch_name])
+            else:
+                sql += " AND master_id IN (SELECT telegram_id FROM masters WHERE telegram_id = ? OR parent_id = ?)"
+                params.extend([master_id, master_id])
+            
+        sql += " ORDER BY completed_at DESC"
+        
+        cursor = await db.execute(sql, tuple(params))
+        rows = await cursor.fetchall()
+        return [dict(row) for row in rows]
+
+async def pay_debt(order_id: int, additional_amount: float, master_id: int | None = None) -> bool:
+    """Nasiyani to'lash."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        c = await db.execute("SELECT paid_amount, price FROM orders WHERE id = ?", (order_id,))
+        row = await c.fetchone()
+        if not row: return False
+        
+        total_paid = row['paid_amount'] + additional_amount
+        
+        query = "UPDATE orders SET paid_amount = ? WHERE id = ?"
+        params = [total_paid, order_id]
+        if master_id is not None:
+            query += " AND master_id = ?"
+            params.append(master_id)
+            
+        await db.execute(query, tuple(params))
+        await db.commit()
+        return total_paid >= row['price']
+
+async def search_orders(query: str, master_id: int | None = None, branch_name: str | None = None) -> list[dict]:
+    """Mijoz tarixini Ism, Telefon, Raqam, Model yoki Sana orqali qidirish."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        
+        months_map = {
+            "yanvar": "01", "yan": "01", "fevral": "02", "fev": "02", "mart": "03", "mar": "03",
+            "aprel": "04", "apr": "04", "may": "05", "iyun": "06", "iyul": "07", "avgust": "08", 
+            "avg": "08", "sentabr": "09", "sen": "09", "oktabr": "10", "okt": "10", 
+            "noyabr": "11", "noy": "11", "dekabr": "12", "dek": "12"
+        }
+        
+        lower_q = query.lower().strip()
+        search_date = ""
+        
+        if "." in query:
+            parts = query.split(".")
+            if len(parts) >= 2 and parts[0].isdigit() and parts[1].isdigit():
+                day = parts[0].zfill(2)
+                month = parts[1].zfill(2)
+                search_date = f"-{month}-{day}"
+        elif lower_q in months_map:
+            search_date = f"-{months_map[lower_q]}-"
+        else:
+            for m_name, m_num in months_map.items():
+                if m_name in lower_q:
+                    day_part = lower_q.replace(m_name, "").strip()
+                    if day_part.isdigit():
+                        day = day_part.zfill(2)
+                        search_date = f"-{m_num}-{day}"
+                    else:
+                        search_date = f"-{m_num}-"
+                    break
+                    
+        sql = """
+            SELECT * FROM orders 
+            WHERE (
+                client_name LIKE ? 
+                OR client_phone LIKE ? 
+                OR car_number LIKE ? 
+                OR car_model LIKE ?
+        """
+        params = [f"%{query}%", f"%{query}%", f"%{query}%", f"%{query}%"]
+        
+        if search_date:
+            sql += " OR created_at LIKE ? OR completed_at LIKE ?"
+            params.extend([f"%{search_date}%", f"%{search_date}%"])
+            
+        sql += ")"
+        if master_id:
+            if branch_name:
+                sql += " AND master_id IN (SELECT telegram_id FROM masters WHERE (telegram_id = ? OR parent_id = ?) AND branch_name = ?)"
+                params.extend([master_id, master_id, branch_name])
+            else:
+                sql += " AND master_id IN (SELECT telegram_id FROM masters WHERE telegram_id = ? OR parent_id = ?)"
+                params.extend([master_id, master_id])
+            
+        sql += " ORDER BY created_at DESC LIMIT 20"
+        
+        cursor = await db.execute(sql, tuple(params))
+        rows = await cursor.fetchall()
+        return [dict(row) for row in rows]
+
+async def get_active_orders(master_id: int | None = None, branch_name: str | None = None, is_personal: bool = False) -> list[dict]:
+    """Faol buyurtmalarni (topshirilmagan / bekor qilinmagan) olish."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        sql = "SELECT * FROM orders WHERE status NOT IN ('topshirildi', 'bekor')"
+        params = []
+        if master_id:
+            if is_personal:
+                sql += " AND master_id = ?"
+                params.append(master_id)
+            elif branch_name:
+                sql += " AND master_id IN (SELECT telegram_id FROM masters WHERE (telegram_id = ? OR parent_id = ?) AND branch_name = ?)"
+                params.extend([master_id, master_id, branch_name])
+            else:
+                sql += " AND master_id IN (SELECT telegram_id FROM masters WHERE telegram_id = ? OR parent_id = ?)"
+                params.extend([master_id, master_id])
+        sql += " ORDER BY created_at DESC"
+        
+        cursor = await db.execute(sql, tuple(params))
+        rows = await cursor.fetchall()
+        return [dict(row) for row in rows]
+
+async def get_all_orders(master_id: int | None = None, branch_name: str | None = None) -> list[dict]:
+    """Barcha mijozlarni (buyurtmalarni) ro'yxatini olish."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        sql = "SELECT * FROM orders"
+        params = []
+        if master_id:
+            if branch_name:
+                sql += " WHERE master_id IN (SELECT telegram_id FROM masters WHERE (telegram_id = ? OR parent_id = ?) AND branch_name = ?)"
+                params.extend([master_id, master_id, branch_name])
+            else:
+                sql += " WHERE master_id IN (SELECT telegram_id FROM masters WHERE telegram_id = ? OR parent_id = ?)"
+                params.extend([master_id, master_id])
+        sql += " ORDER BY created_at DESC"
+        cursor = await db.execute(sql, tuple(params))
+        rows = await cursor.fetchall()
+        return [dict(row) for row in rows]
+
+async def get_weekly_history(master_id: int | None = None, branch_name: str | None = None) -> list[dict]:
+    """Oxirgi 7 kunda topshirilgan buyurtmalarni olish."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        seven_days_ago = (datetime.now(TZ_UZB) - timedelta(days=7)).strftime("%Y-%m-%d %H:%M:%S")
+        sql = "SELECT * FROM orders WHERE status = 'topshirildi' AND completed_at >= ?"
+        params = [seven_days_ago]
+        if master_id:
+            if branch_name:
+                sql += " AND master_id IN (SELECT telegram_id FROM masters WHERE (telegram_id = ? OR parent_id = ?) AND branch_name = ?)"
+                params.extend([master_id, master_id, branch_name])
+            else:
+                sql += " AND master_id IN (SELECT telegram_id FROM masters WHERE telegram_id = ? OR parent_id = ?)"
+                params.extend([master_id, master_id])
+        sql += " ORDER BY completed_at DESC"
+        cursor = await db.execute(sql, tuple(params))
+        rows = await cursor.fetchall()
+        return [dict(row) for row in rows]
+
+async def get_history_by_period(master_id: int, period: str) -> list[dict]:
+    """Admin panel uchun ustaning tarixini vaqt bo'yicha olish."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        # Boshliqlar ustidan emas, shartli master o'zini va shogirdlarini hisobga olsin
+        cond_master = "AND master_id IN (SELECT telegram_id FROM masters WHERE telegram_id = ? OR parent_id = ?)"
+        params = []
+        
+        now = datetime.now(TZ_UZB)
+        
+        if period == "today":
+            date_filter = "AND DATE(completed_at) = ?"
+            params.append(now.strftime("%Y-%m-%d"))
+        elif period == "weekly":
+            seven_days_ago = (now - timedelta(days=7)).strftime("%Y-%m-%d %H:%M:%S")
+            date_filter = "AND completed_at >= ?"
+            params.append(seven_days_ago)
+        elif period == "monthly":
+            date_filter = "AND strftime('%Y-%m', completed_at) = ?"
+            params.append(now.strftime("%Y-%m"))
+        elif period == "all":
+            date_filter = ""
+        else:
+            return []
+            
+        sql = f"SELECT * FROM orders WHERE status = 'topshirildi' {date_filter} {cond_master} ORDER BY completed_at DESC"
+        params.extend([master_id, master_id])
+        
+        cursor = await db.execute(sql, tuple(params))
+        rows = await cursor.fetchall()
+        return [dict(row) for row in rows]
+
+# ═══════════════════════════════════════════════
+#  STATISTIKA VA EKSPORT
+# ═══════════════════════════════════════════════
+
+async def get_daily_stats(master_id: int | None = None, branch_name: str | None = None) -> dict:
+    today = datetime.now(TZ_UZB).strftime("%Y-%m-%d")
+    async with aiosqlite.connect(DB_PATH) as db:
+        cond_master = ""
+        params = [today]
+        
+        if master_id:
+            if branch_name:
+                cond_master = "AND master_id IN (SELECT telegram_id FROM masters WHERE (telegram_id = ? OR parent_id = ?) AND branch_name = ?)"
+                params.extend([master_id, master_id, branch_name])
+            else:
+                cond_master = "AND master_id IN (SELECT telegram_id FROM masters WHERE telegram_id = ? OR parent_id = ?)"
+                params.extend([master_id, master_id])
+        
+        cursor = await db.execute(
+            f"SELECT COUNT(*) as cnt, COALESCE(SUM(price), 0) as total, COALESCE(SUM(cost), 0) as cost_total FROM orders WHERE DATE(created_at) = ? {cond_master}",
+            tuple(params)
+        )
+        received_count, received_total, received_cost = await cursor.fetchone()
+
+        cursor = await db.execute(
+            f"SELECT COUNT(*) as cnt, COALESCE(SUM(price), 0) as total, COALESCE(SUM(cost), 0) as cost_total FROM orders WHERE DATE(completed_at) = ? AND status = 'topshirildi' {cond_master}",
+            tuple(params)
+        )
+        completed_count, completed_total, completed_cost = await cursor.fetchone()
+
+        cursor = await db.execute(
+            f"SELECT payment_method, COALESCE(SUM(paid_amount), 0) FROM orders WHERE DATE(completed_at) = ? AND status = 'topshirildi' {cond_master} GROUP BY payment_method",
+            tuple(params)
+        )
+        p_rows = await cursor.fetchall()
+        p_stats = {'naqd': 0, 'karta': 0, 'nasiya': 0}
+        for pm, amt in p_rows:
+            pm = pm or 'naqd'
+            if pm in p_stats: p_stats[pm] += amt
+
+        return {
+            "received_count": received_count,
+            "received_total": received_total,
+            "received_cost": received_cost,
+            "completed_count": completed_count,
+            "completed_total": completed_total,
+            "completed_cost": completed_cost,
+            "naqd": p_stats['naqd'],
+            "karta": p_stats['karta'],
+            "nasiya": p_stats['nasiya'],
+        }
+
+async def get_monthly_stats(master_id: int | None = None, branch_name: str | None = None) -> dict:
+    month = datetime.now(TZ_UZB).strftime("%Y-%m")
+    async with aiosqlite.connect(DB_PATH) as db:
+        cond_master = ""
+        params = [month]
+        
+        if master_id:
+            if branch_name:
+                cond_master = "AND master_id IN (SELECT telegram_id FROM masters WHERE (telegram_id = ? OR parent_id = ?) AND branch_name = ?)"
+                params.extend([master_id, master_id, branch_name])
+            else:
+                cond_master = "AND master_id IN (SELECT telegram_id FROM masters WHERE telegram_id = ? OR parent_id = ?)"
+                params.extend([master_id, master_id])
+        
+        cursor = await db.execute(
+            f"SELECT COUNT(*) as cnt, COALESCE(SUM(price), 0) as total, COALESCE(SUM(cost), 0) as cost_total FROM orders WHERE strftime('%Y-%m', created_at) = ? {cond_master}",
+            tuple(params)
+        )
+        received_count, received_total, received_cost = await cursor.fetchone()
+
+        cursor = await db.execute(
+            f"SELECT COUNT(*) as cnt, COALESCE(SUM(price), 0) as total, COALESCE(SUM(cost), 0) as cost_total FROM orders WHERE strftime('%Y-%m', completed_at) = ? AND status = 'topshirildi' {cond_master}",
+            tuple(params)
+        )
+        completed_count, completed_total, completed_cost = await cursor.fetchone()
+
+        master_params = []
+        if master_id:
+            if branch_name:
+                master_params.extend([master_id, master_id, branch_name])
+            else:
+                master_params.extend([master_id, master_id])
+                
+        cursor = await db.execute(
+            f"SELECT COUNT(*) FROM orders WHERE status NOT IN ('topshirildi', 'bekor') {cond_master}",
+            tuple(master_params)
+        )
+        row = await cursor.fetchone()
+        active_count = row[0]
+
+        cursor = await db.execute(
+            f"SELECT payment_method, COALESCE(SUM(paid_amount), 0) FROM orders WHERE strftime('%Y-%m', completed_at) = ? AND status = 'topshirildi' {cond_master} GROUP BY payment_method",
+            tuple(params)
+        )
+        p_rows = await cursor.fetchall()
+        p_stats = {'naqd': 0, 'karta': 0, 'nasiya': 0}
+        for pm, amt in p_rows:
+            pm = pm or 'naqd'
+            if pm in p_stats: p_stats[pm] += amt
+
+        return {
+            "received_count": received_count,
+            "received_total": received_total,
+            "received_cost": received_cost,
+            "completed_count": completed_count,
+            "completed_total": completed_total,
+            "completed_cost": completed_cost,
+            "active_count": active_count,
+            "naqd": p_stats['naqd'],
+            "karta": p_stats['karta'],
+            "nasiya": p_stats['nasiya'],
+        }
+
+async def get_all_time_stats(master_id: int | None = None, branch_name: str | None = None) -> dict:
+    async with aiosqlite.connect(DB_PATH) as db:
+        cond_master = ""
+        params = []
+        
+        if master_id:
+            if branch_name:
+                cond_master = "AND master_id IN (SELECT telegram_id FROM masters WHERE (telegram_id = ? OR parent_id = ?) AND branch_name = ?)"
+                params.extend([master_id, master_id, branch_name])
+            else:
+                cond_master = "AND master_id IN (SELECT telegram_id FROM masters WHERE telegram_id = ? OR parent_id = ?)"
+                params.extend([master_id, master_id])
+        
+        where_clause = f"WHERE 1=1 {cond_master}"
+        
+        cursor = await db.execute(
+            f"SELECT COUNT(*) as cnt, COALESCE(SUM(price), 0) as total, COALESCE(SUM(cost), 0) as cost_total FROM orders {where_clause}",
+            tuple(params)
+        )
+        received_count, received_total, received_cost = await cursor.fetchone()
+
+        cursor = await db.execute(
+            f"SELECT COUNT(*) as cnt, COALESCE(SUM(price), 0) as total, COALESCE(SUM(cost), 0) as cost_total FROM orders {where_clause} AND status = 'topshirildi'",
+            tuple(params)
+        )
+        completed_count, completed_total, completed_cost = await cursor.fetchone()
+
+        master_params = []
+        if master_id:
+            if branch_name:
+                master_params.extend([master_id, master_id, branch_name])
+            else:
+                master_params.extend([master_id, master_id])
+                
+        cursor = await db.execute(
+            f"SELECT COUNT(*) FROM orders WHERE status NOT IN ('topshirildi', 'bekor') {cond_master}",
+            tuple(master_params)
+        )
+        row = await cursor.fetchone()
+        active_count = row[0]
+
+        cursor = await db.execute(
+            f"SELECT payment_method, COALESCE(SUM(paid_amount), 0) FROM orders {where_clause} AND status = 'topshirildi' GROUP BY payment_method",
+            tuple(params)
+        )
+        p_rows = await cursor.fetchall()
+        p_stats = {'naqd': 0, 'karta': 0, 'nasiya': 0}
+        for pm, amt in p_rows:
+            pm = pm or 'naqd'
+            if pm in p_stats: p_stats[pm] += amt
+
+        return {
+            "received_count": received_count,
+            "received_total": received_total,
+            "received_cost": received_cost,
+            "completed_count": completed_count,
+            "completed_total": completed_total,
+            "completed_cost": completed_cost,
+            "active_count": active_count,
+            "naqd": p_stats['naqd'],
+            "karta": p_stats['karta'],
+            "nasiya": p_stats['nasiya'],
+        }
+
+async def export_orders_to_excel() -> bytes:
+    import io
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute("SELECT * FROM orders ORDER BY created_at DESC")
+        rows = await cursor.fetchall()
+        
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        ws.title = "Buyurtmalar"
+        
+        if not rows:
+            buffer = io.BytesIO()
+            wb.save(buffer)
+            return buffer.getvalue()
+            
+        col_names = {
+            "id": "Tartib #",
+            "master_id": "Usta ID",
+            "client_name": "Mijoz Ismi",
+            "client_phone": "Telefon Raqam",
+            "car_model": "Mashina Rusumi",
+            "car_number": "Davlat Raqami",
+            "problem": "Muammo/Xizmat turi",
+            "car_condition": "Mashina Holati",
+            "price": "Kelishilgan Summa",
+            "cost": "Xarajat",
+            "profit": "Sof Foyda",
+            "warranty": "Kafolat",
+            "warranty_until": "Kafolat Tugashi",
+            "security_code": "Qo'shimcha izoh",
+            "status": "Holati (Status)",
+            "created_at": "Qabul qilingan sana",
+            "completed_at": "Topshirilgan sana",
+            "payment_method": "To'lov usuli",
+            "paid_amount": "To'langan summa"
+        }
+            
+        original_keys = list(dict(rows[0]).keys())
+        original_keys.append("profit")
+        translated_headers = [col_names.get(k, k) for k in original_keys]
+        ws.append(translated_headers)
+        
+        from openpyxl.styles import Font, Alignment
+        
+        col_widths = {
+            "A": 10, "B": 10, "C": 25, "D": 20, "E": 25,
+            "F": 20, "G": 30, "H": 25, "I": 15, "J": 15,
+            "K": 20, "L": 15, "M": 20, "N": 20, "O": 20
+        }
+        
+        for col_letter, width in col_widths.items():
+            ws.column_dimensions[col_letter].width = width
+            
+        for cell in ws[1]:
+            cell.font = Font(bold=True, color="FFFFFF")
+            cell.fill = openpyxl.styles.PatternFill(start_color="4F81BD", end_color="4F81BD", fill_type="solid")
+            cell.alignment = Alignment(horizontal="center", vertical="center")
+            
+        total_price = 0
+        total_cost = 0
+        total_profit = 0
+        
+        for row in rows:
+            row_dict = dict(row)
+            if "price" in row_dict and row_dict["price"] is not None:
+                row_dict["price"] = int(row_dict["price"])
+            if "cost" in row_dict and row_dict["cost"] is not None:
+                row_dict["cost"] = int(row_dict["cost"])
+            
+            profit = row_dict.get("price", 0) - row_dict.get("cost", 0)
+            row_dict["profit"] = profit
+            
+            total_price += row_dict.get("price", 0)
+            total_cost += row_dict.get("cost", 0)
+            total_profit += profit
+                
+            if "status" in row_dict and row_dict["status"]:
+                row_dict["status"] = str(row_dict["status"]).replace("_", " ").capitalize()
+                
+            ws.append([row_dict.get(k, "") for k in original_keys])
+            
+        ws.append([""] * len(original_keys))
+        
+        jami_row = [""] * len(original_keys)
+        price_idx = original_keys.index("price") if "price" in original_keys else -1
+        cost_idx = original_keys.index("cost") if "cost" in original_keys else -1
+        profit_idx = original_keys.index("profit") if "profit" in original_keys else -1
+        
+        if price_idx > 0:
+            jami_row[price_idx - 1] = "JAMI YIG'INDI:"
+        
+        if price_idx != -1: jami_row[price_idx] = total_price
+        if cost_idx != -1: jami_row[cost_idx] = total_cost
+        if profit_idx != -1: jami_row[profit_idx] = total_profit
+        
+        ws.append(jami_row)
+        
+        total_r = ws.max_row
+        for col_i in range(1, len(original_keys) + 1):
+            c = ws.cell(row=total_r, column=col_i)
+            c.font = Font(bold=True)
+            if jami_row[col_i-1] != "":
+                c.fill = openpyxl.styles.PatternFill(start_color="e6f2ff", end_color="e6f2ff", fill_type="solid")
+            
+        for row in ws.iter_rows(min_row=2, max_col=len(original_keys), max_row=len(rows)+1):
+            for cell in row:
+                cell.alignment = Alignment(vertical="center", wrap_text=True)
+            
+        buffer = io.BytesIO()
+        wb.save(buffer)
+                
+    return buffer.getvalue()
+
+async def get_next_service_reminders() -> list[dict]:
+    """Bugun keyingi tashrif muddati kelgan ishlarni qaytaradi (Mijozni Qaytarish tizimi)."""
+    today = datetime.now(TZ_UZB).strftime("%Y-%m-%d")
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute(
+            "SELECT * FROM orders WHERE DATE(next_service_date) = ?",
+            (today,)
+        )
+        rows = await cursor.fetchall()
+        return [dict(row) for row in rows]
